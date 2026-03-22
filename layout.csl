@@ -50,10 +50,8 @@ const memcpy = @import_module("<memcpy/get_params>", .{
 });
 
 layout {
-  // PE coordinates are (column, row)
   @set_rectangle(kernel_x_dim, kernel_y_dim);
 
-  // PE rectangle dimensions should evenly divide matrix dimensions
   @comptime_assert(M % kernel_y_dim == 0);
   @comptime_assert(H % kernel_x_dim == 0);
   @comptime_assert(N % kernel_y_dim == 0);
@@ -61,16 +59,6 @@ layout {
   @comptime_assert(kernel_x_dim >= 2);
   @comptime_assert(kernel_y_dim >= 2);
 
-  // The tensor mapping is fixed for this homework, so we can precompute the parameters for each PE
-  //  and pass them in via the tile code. This struct will be concatenated with the memcpy parameters. 
-  // e.g.:
-  //     @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-  //       common_params,
-  //       .{.memcpy_params = memcpy.get_params(pe_x),
-  //         .reduce_tx_color = reduce_tx_color,
-  //         .reduce_rx_color = reduce_rx_color,
-  //       },
-  //     ));
   const common_params = .{
     .dM = M / kernel_y_dim,
     .dN = N / kernel_x_dim,
@@ -82,42 +70,90 @@ layout {
     .broadcast_rx_color = broadcast_rx_color,
   };
 
-  // ===========================================================================
-  // TODO: Implement tile code assignment and fabric routing.
-  //
-  // For each PE(pe_x, pe_y) you must:
-  //
-  //  1) Configure broadcast routes using @set_color_config.
-  //     Broadcasting sends B-column data from each PE in turn down the
-  //     Y-column. Use color swap or an additional PE to change the color.
-  //     Hint: if you need to send SWITCH_ADV signals on the same color, 
-  //     also RAMP needs swap_x and swap_y to be enabled.
-  //
-  //  2) Upon receiving a broadcast wavelet, a PE should trigger a SAXPY operation
-  //     to update its partial C column.
-  //
-  //  2) Configure reduction ring routes using @set_color_config. Remember that colors
-  //     need to be alternated.
-  //     Each PE needs 3 colors:
-  //       reduce_tx_color: RAMP -> fabric (the PE's own send)
-  //       reduce_rx_color: fabric -> RAMP (the PE's own receive)
-  //       flyover color: passthrough for the other ring traffic
-  //
-  // Useful API:
-  //   @set_tile_code(pe_x, pe_y, "pe.csl", params_struct)
-  //   @set_color_config(pe_x, pe_y, color, .{ .routes = .{...}, .switches = .{...} })
-  //   @concat_structs(struct1, struct2)
-  //   memcpy.get_params(pe_x)
-  //   Directions: NORTH, SOUTH, EAST, WEST, RAMP
-  // ===========================================================================
-  //
+  for (@range(i16, kernel_x_dim)) |pe_x| {
+    for (@range(i16, kernel_y_dim)) |pe_y| {
 
-  // TODO: Your routing implementation here
+      if (pe_x % 2 == 0) {
+        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+          common_params,
+          .{
+            .memcpy_params = memcpy.get_params(pe_x),
+            .reduce_tx_color = reduce_A_color,
+            .reduce_rx_color = reduce_B_color,
+            .scatter_color = reduce_C_color,
+          },
+        ));
+      } else {
+        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+          common_params,
+          .{
+            .memcpy_params = memcpy.get_params(pe_x),
+            .reduce_tx_color = reduce_B_color,
+            .reduce_rx_color = reduce_A_color,
+            .scatter_color = reduce_C_color,
+          },
+        ));
+      }
 
-  // Export symbol names
+      if (pe_y == 0) {
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+            .routes = .{ .rx = .{SOUTH}, .color_swap_y = true },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+            .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP}, .color_swap_y = true },
+        });
+      } else if (pe_y == kernel_y_dim - 1) {
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
+        });
+      }
+
+      if (pe_x % 2 == 0) {
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
+        });
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{
+          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
+        });
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{
+          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
+        });
+      }
+
+      if (pe_x == kernel_x_dim - 1) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{WEST} },
+        });
+      } else if (pe_x == 0) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{EAST}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} },
+        });
+      }
+    }
+  }
+
   @export_name("A", [*]f32, true);
   @export_name("B", [*]f32, true);
   @export_name("C", [*]f32, true);
   @export_name("time_buf_u16", [*]u16, true);
   @export_name("broadcast_pe", fn () void);
 }
+

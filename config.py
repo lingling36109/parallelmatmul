@@ -20,13 +20,13 @@
 # =============================================================================
 
 # --- Matrix A (M x H) ---
-A_GLOBAL_TRANSPOSE = ???  # TODO
-A_MEMORY_TRANSPOSE = ???  # TODO
+A_GLOBAL_TRANSPOSE = False
+A_MEMORY_TRANSPOSE = True
 
 # --- Matrix B (H x N) ---
-B_GLOBAL_TRANSPOSE = ???  # TODO
-B_MEMORY_TRANSPOSE = ???  # TODO
+B_GLOBAL_TRANSPOSE = True
+B_MEMORY_TRANSPOSE = True
 
 # --- Matrix C (M x N) ---
-C_GLOBAL_TRANSPOSE = ???  # TODO
-C_MEMORY_TRANSPOSE = ???  # TODO
+C_GLOBAL_TRANSPOSE = False
+C_MEMORY_TRANSPOSE = True
