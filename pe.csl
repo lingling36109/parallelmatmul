@@ -255,10 +255,10 @@ comptime {
   @comptime_assert(@is_arch("wse2"));
 
   // Bind data task: broadcast_tx_color wavelets trigger recv_broadcast_task
-  @bind_data_task(recv_broadcast_task, @get_color_id(broadcast_tx_color));
+  @bind_data_task(recv_broadcast_task, broadcast_tx_color);
 
   // Block the reduce rx color so wavelets wait for DSD reads
-  @block(@get_color_id(reduce_rx_color));
+  @block(reduce_rx_color);
 
   @export_symbol(ptr_A, "A");
   @export_symbol(ptr_B, "B");
