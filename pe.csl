@@ -11,7 +11,7 @@ param reduce_tx_color: color;
 param reduce_rx_color: color;
 param scatter_color: color;
 
-// Broadcast receive colors (one per PE row, up to 8)
+// Broadcast receive colors
 param bcast_color_0: color;
 param bcast_color_1: color;
 param bcast_color_2: color;
@@ -25,9 +25,7 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-// =============================================================================
 // TSC timer buffers
-// =============================================================================
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
@@ -48,9 +46,7 @@ fn end_timer() void {
     time_buf_u16[5] = tscEndBuffer[2];
 }
 
-// =============================================================================
 // Queue declarations
-// =============================================================================
 const broadcast_oq: output_queue = @get_output_queue(2);
 const reduce_oq: output_queue = @get_output_queue(3);
 const reduce_iq: input_queue = @get_input_queue(2);
@@ -58,9 +54,7 @@ const flyover_color: color = scatter_color;
 const flyover_oq: output_queue = @get_output_queue(4);
 const flyover_iq: input_queue = @get_input_queue(4);
 
-// =============================================================================
 // Storage
-// =============================================================================
 var A: [dM * dH]f32 = @zeros([dM * dH]f32);
 var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
@@ -78,9 +72,7 @@ const accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM })
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
-// =============================================================================
 // Global state
-// =============================================================================
 var send_col: i16 = 0;
 var proc_source: i16 = 0;
 var proc_col: i16 = 0;
@@ -93,9 +85,7 @@ const send_done_task_id: local_task_id = @get_local_task_id(17);
 const gemv_task_id: local_task_id = @get_local_task_id(18);
 const reduce_done_task_id: local_task_id = @get_local_task_id(19);
 
-// =============================================================================
 // Broadcast receive
-// =============================================================================
 fn handle_bcast(stream: i16, val: f32) void {
     const col = b_buf_col[stream];
     const pos = b_buf_wpos[stream];
@@ -112,7 +102,7 @@ fn handle_bcast(stream: i16, val: f32) void {
 
 fn try_start_gemv() void {
     if (gemv_active) return;
-    if (proc_source >= kernel_y_dim) return;
+    if (proc_col >= dN_y) return; // All local columns done
     if (stream_cols_ready[proc_source] > 0) {
         gemv_active = true;
         @activate(gemv_task_id);
@@ -128,30 +118,27 @@ task recv_bcast_5(val: f32) void { handle_bcast(5, val); }
 task recv_bcast_6(val: f32) void { handle_bcast(6, val); }
 task recv_bcast_7(val: f32) void { handle_bcast(7, val); }
 
-// =============================================================================
 // GEMV task
-// =============================================================================
 task gemv_task() void {
     const s = proc_source;
+    const c = proc_col;
     var h: i16 = 0;
     while (h < dH) : (h += 1) {
         var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
         a_col_dsd = @increment_dsd_offset(a_col_dsd, h * dM, f32);
-        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + proc_col * dH + h)]);
+        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + c * dH + h)]);
     }
 
-    const global_col = s * dN_y + proc_col;
+    const global_col = s * dN_y + c;
     reduce_async(global_col);
 }
 
-// =============================================================================
 // Async Ring Reduction
-// =============================================================================
 fn reduce_async(global_col: i16) void {
     const my_x = @as(i16, layout_mod.get_x_coord());
     const fsum_pe = global_col / dN;
     const isum_pe = (fsum_pe + 1) % kernel_x_dim;
-    const local_c_col = global_col - fsum_pe * dN;
+    const local_c_col = global_col % dN; // Simplified local column indexing
 
     var c_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
     c_col_dsd = @increment_dsd_offset(c_col_dsd, local_c_col * dM, f32);
@@ -164,31 +151,22 @@ fn reduce_async(global_col: i16) void {
     if (kernel_x_dim == 1) {
         @fmovs(c_col_dsd, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
     } else if (my_x == isum_pe) {
-        if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
-        } else {
-            @fmovs(fabout_reduce, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
-        }
+        const out = if (my_x == kernel_x_dim - 1) fabout_flyover else fabout_reduce;
+        @fmovs(out, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
     } else if (my_x == fsum_pe) {
-        if (my_x == 0) {
-            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
-        } else {
-            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
-        }
+        const in = if (my_x == 0) fabin_flyover else fabin_reduce;
+        @fadds(c_col_dsd, accum_dsd, in, .{ .async = true, .activate = reduce_done_task_id });
     } else {
-        if (my_x == 0) {
-            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
-        } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
-        } else {
-            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
-        }
+        const in = if (my_x == 0) fabin_flyover else fabin_reduce;
+        const out = if (my_x == kernel_x_dim - 1) fabout_flyover else fabout_reduce;
+        @fadds(out, accum_dsd, in, .{ .async = true, .activate = reduce_done_task_id });
     }
 }
 
 task reduce_done_task() void {
     @fmovs(accum_dsd, zeros_dsd, .{});
     stream_cols_ready[proc_source] -= 1;
+
     proc_source += 1;
     if (proc_source >= kernel_y_dim) {
         proc_source = 0;
@@ -205,16 +183,14 @@ task reduce_done_task() void {
     try_start_gemv();
 }
 
-// =============================================================================
 // Synchronous Broadcast Send
-// =============================================================================
 task send_b_task() void {
     send_col = 0;
     send_next_column();
 }
 
 fn send_next_column() void {
-    if (send_col >= dN_y) { return; }
+    if (send_col >= dN_y) return;
 
     var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
     b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
