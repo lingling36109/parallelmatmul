@@ -102,6 +102,7 @@ var stream_cols_ready: [8]i16 = @zeros([8]i16);
 const send_task_id: local_task_id = @get_local_task_id(16);
 const send_done_task_id: local_task_id = @get_local_task_id(17);
 const gemv_task_id: local_task_id = @get_local_task_id(18);
+const reduce_done_task_id: local_task_id = @get_local_task_id(19);
 
 // =============================================================================
 // Broadcast receive: buffer wavelets, trigger GEMV when column complete
