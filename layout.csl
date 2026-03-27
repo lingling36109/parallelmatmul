@@ -24,15 +24,15 @@ param M: i16;
 param H: i16;
 param N: i16;
 
-// Broadcast colors (8-15)
-const x_col0: color = @get_color(8);
-const x_col1: color = @get_color(9);
-const x_col2: color = @get_color(10);
-const x_col3: color = @get_color(11);
-const x_col4: color = @get_color(12);
-const x_col5: color = @get_color(13);
-const x_col6: color = @get_color(14);
-const x_col7: color = @get_color(15);
+// Define the 8 broadcast colors
+const c0: color = @get_color(8);
+const c1: color = @get_color(9);
+const c2: color = @get_color(10);
+const c3: color = @get_color(11);
+const c4: color = @get_color(12);
+const c5: color = @get_color(13);
+const c6: color = @get_color(14);
+const c7: color = @get_color(15);
 
 const memcpy = @import_module("<memcpy/get_params>", .{
     .width = kernel_x_dim,
@@ -46,37 +46,29 @@ layout {
     for (@range(i16, kernel_x_dim)) |pe_x| {
         for (@range(i16, kernel_y_dim)) |pe_y| {
 
-            // 1. Identify which color THIS row uses to broadcast
+            // Determine the color this specific PE uses to broadcast its row of B
             const my_color = @get_color(8 + pe_y);
 
-            // 2. Configure routing for ALL possible broadcast colors in the column
-            // We use a simple North-to-South flow for all broadcast colors
-            @set_color_config(pe_x, pe_y, x_col0, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col1, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col3, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col4, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col5, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col6, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_col7, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            // Configure routing for the broadcast colors.
+            // We configure all 8 to be safe, using North-to-South flow.
+            @set_color_config(pe_x, pe_y, c0, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c1, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c3, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c4, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c5, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c6, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            @set_color_config(pe_x, pe_y, c7, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
 
-            // 3. Assign code to the PE
+            // Assign code to EVERY PE in the loop
             @set_tile_code(pe_x, pe_y, "pe.csl", .{
                 .memcpy_params = memcpy.get_params(pe_x),
                 .dM = M / kernel_y_dim,
                 .dH = H / kernel_x_dim,
                 .dN = N / kernel_x_dim,
-                .kernel_x_dim = kernel_x_dim,
-                .kernel_y_dim = kernel_y_dim,
                 .my_bcast_color = my_color,
-                .bcast_color_0 = x_col0,
-                .bcast_color_1 = x_col1,
-                .bcast_color_2 = x_col2,
-                .bcast_color_3 = x_col3,
-                .bcast_color_4 = x_col4,
-                .bcast_color_5 = x_col5,
-                .bcast_color_6 = x_col6,
-                .bcast_color_7 = x_col7
+                .b0 = c0, .b1 = c1, .b2 = c2, .b3 = c3,
+                .b4 = c4, .b5 = c5, .b6 = c6, .b7 = c7
             });
         }
     }

@@ -2,32 +2,23 @@ param memcpy_params: comptime_struct;
 param dM: i16;
 param dH: i16;
 param dN: i16;
-param kernel_x_dim: i16;
-param kernel_y_dim: i16;
 param my_bcast_color: color;
 
-param bcast_color_0: color;
-param bcast_color_1: color;
-param bcast_color_2: color;
-param bcast_color_3: color;
-param bcast_color_4: color;
-param bcast_color_5: color;
-param bcast_color_6: color;
-param bcast_color_7: color;
+// Receive colors
+param b0: color; param b1: color; param b2: color; param b3: color;
+param b4: color; param b5: color; param b6: color; param b7: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const timestamp = @import_module("<time>");
 
-// Buffers
 var B = @zeros([dH * dN]f32);
 var C = @zeros([dM * dN]f32);
 var time_buf = @zeros([6]u16);
 var ptr_time_buf: [*]u16 = &time_buf;
 
-// Task IDs: Using ID 28 to stay clear of color-mapped task IDs (which are usually < 24)
-const compute_task_id: local_task_id = @get_local_task_id(28);
+// Move Task ID to 30 to avoid overlap with color-mapped task IDs (8-15)
+const main_task_id: local_task_id = @get_local_task_id(30);
 
-// DSDs
 const out_dsd = @get_dsd(fabout_dsd, .{
     .extent = dN,
     .fabric_color = my_bcast_color,
@@ -38,25 +29,23 @@ const b_mem_dsd = @get_dsd(mem1d_dsd, .{
     .tensor_access = |i|{dH * dN} -> B[i]
 });
 
-// Tasks
-task do_compute() void {
-    // Local compute logic for B-block broadcast
+task send_b_task() void {
     @mov32(out_dsd, b_mem_dsd);
 }
 
-// Data tasks for receiving broadcasts
-task recv_0(data: f32) void { C[0] += data; }
-task recv_1(data: f32) void { C[0] += data; }
-task recv_2(data: f32) void { C[0] += data; }
-task recv_3(data: f32) void { C[0] += data; }
-task recv_4(data: f32) void { C[0] += data; }
-task recv_5(data: f32) void { C[0] += data; }
-task recv_6(data: f32) void { C[0] += data; }
-task recv_7(data: f32) void { C[0] += data; }
+// Minimal tasks to satisfy color bindings
+task r0(data: f32) void { C[0] += data; }
+task r1(data: f32) void { C[0] += data; }
+task r2(data: f32) void { C[0] += data; }
+task r3(data: f32) void { C[0] += data; }
+task r4(data: f32) void { C[0] += data; }
+task r5(data: f32) void { C[0] += data; }
+task r6(data: f32) void { C[0] += data; }
+task r7(data: f32) void { C[0] += data; }
 
 fn broadcast_pe() void {
     timestamp.get_tsc(ptr_time_buf);
-    @activate(compute_task_id);
+    @activate(main_task_id);
 }
 
 fn terminate_kernel() void {
@@ -65,17 +54,17 @@ fn terminate_kernel() void {
 }
 
 comptime {
-    @bind_local_task(do_compute, compute_task_id);
+    @bind_local_task(send_b_task, main_task_id);
 
-    // Bind tasks to colors 8 through 15
-    @bind_data_task(recv_0, @get_data_task_id(bcast_color_0));
-    @bind_data_task(recv_1, @get_data_task_id(bcast_color_1));
-    @bind_data_task(recv_2, @get_data_task_id(bcast_color_2));
-    @bind_data_task(recv_3, @get_data_task_id(bcast_color_3));
-    @bind_data_task(recv_4, @get_data_task_id(bcast_color_4));
-    @bind_data_task(recv_5, @get_data_task_id(bcast_color_5));
-    @bind_data_task(recv_6, @get_data_task_id(bcast_color_6));
-    @bind_data_task(recv_7, @get_data_task_id(bcast_color_7));
+    // Bind all potential broadcast colors to tasks
+    @bind_data_task(r0, @get_data_task_id(b0));
+    @bind_data_task(r1, @get_data_task_id(b1));
+    @bind_data_task(r2, @get_data_task_id(b2));
+    @bind_data_task(r3, @get_data_task_id(b3));
+    @bind_data_task(r4, @get_data_task_id(b4));
+    @bind_data_task(r5, @get_data_task_id(b5));
+    @bind_data_task(r6, @get_data_task_id(b6));
+    @bind_data_task(r7, @get_data_task_id(b7));
 
     @export_symbol(ptr_time_buf, "time_buf_u16");
     @export_symbol(broadcast_pe);
