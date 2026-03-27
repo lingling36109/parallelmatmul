@@ -211,7 +211,7 @@ task finish_reduce() void {
 // Switch advance task: after sending B data, advance the switch
 // =============================================================================
 task send_switch_adv() void {
-  const switch_payload = ctrl.encode_single_payload(ctrl.opcode.SWITCH_ADV, true, {}, 0);
+  const switch_payload = ctrl.encode_single_payload(ctrl.opcode.SWITCH_ADV, true, .{}, 0);
   const switch_dsd = @get_dsd(fabout_dsd, .{
     .extent = 1,
     .control = true,
@@ -255,7 +255,7 @@ comptime {
   @comptime_assert(@is_arch("wse2"));
 
   // Bind data task: broadcast_tx_color wavelets trigger recv_broadcast_task
-  @bind_data_task(recv_broadcast_task, broadcast_tx_color);
+  @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_tx_color));
 
   // Block the reduce rx color so wavelets wait for DSD reads
   @block(reduce_rx_color);
