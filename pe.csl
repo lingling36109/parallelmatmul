@@ -4,49 +4,49 @@ param dM: i16;
 param dN: i16;
 param dN_y: i16;
 param dH: i16;
-param kernel_x_dim: i16; [cite: 2]
-param kernel_y_dim: i16; [cite: 2]
+param kernel_x_dim: i16;
+param kernel_y_dim: i16;
 param my_bcast_color: color;
 param reduce_tx_color: color;
 param reduce_rx_color: color;
 param scatter_color: color;
 
 // Broadcast receive colors (one per PE row, up to 8)
-param bcast_color_0: color; [cite: 3]
+param bcast_color_0: color;
 param bcast_color_1: color;
 param bcast_color_2: color;
-param bcast_color_3: color; [cite: 4]
+param bcast_color_3: color;
 param bcast_color_4: color;
 param bcast_color_5: color;
 param bcast_color_6: color;
 param bcast_color_7: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
-const layout_mod = @import_module("<layout>"); [cite: 5]
+const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
 // =============================================================================
 // TSC timer buffers
 // =============================================================================
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
-var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16); [cite: 6]
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
-fn start_timer() void { [cite: 7]
+fn start_timer() void {
     timestamp.enable_tsc();
     timestamp.get_timestamp(&tscStartBuffer);
     time_buf_u16[0] = tscStartBuffer[0];
     time_buf_u16[1] = tscStartBuffer[1];
     time_buf_u16[2] = tscStartBuffer[2];
-} [cite: 8]
+}
 
 fn end_timer() void {
     timestamp.get_timestamp(&tscEndBuffer);
     time_buf_u16[3] = tscEndBuffer[0];
     time_buf_u16[4] = tscEndBuffer[1];
     time_buf_u16[5] = tscEndBuffer[2];
-} [cite: 9]
+}
 
 // =============================================================================
 // Queue declarations
@@ -54,60 +54,56 @@ fn end_timer() void {
 const broadcast_oq: output_queue = @get_output_queue(2);
 const reduce_oq: output_queue = @get_output_queue(3);
 const reduce_iq: input_queue = @get_input_queue(2);
-const flyover_color: color = scatter_color; [cite: 10]
+const flyover_color: color = scatter_color;
 const flyover_oq: output_queue = @get_output_queue(4);
 const flyover_iq: input_queue = @get_input_queue(4);
 
 // =============================================================================
 // Storage
 // =============================================================================
-var A: [dM * dH]f32 = @zeros([dM * dH]f32); [cite: 11]
-var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32); [cite: 12]
+var A: [dM * dH]f32 = @zeros([dM * dH]f32);
+var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
-var ptr_A: [*]f32 = &A; [cite: 13]
+var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-// Per-stream B column buffer
-var b_bufs: [8 * dN_y * dH]f32 = @zeros([8 * dN_y * dH]f32); [cite: 14]
-var b_buf_wpos: [8]i16 = @zeros([8]i16); [cite: 15]
+var b_bufs: [8 * dN_y * dH]f32 = @zeros([8 * dN_y * dH]f32);
+var b_buf_wpos: [8]i16 = @zeros([8]i16);
 var b_buf_col: [8]i16 = @zeros([8]i16);
 
-// Single accumulator for GEMV output
-var accum: [dM]f32 = @zeros([dM]f32); [cite: 16]
-const accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM }); [cite: 17]
+var accum: [dM]f32 = @zeros([dM]f32);
+const accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
 
-// Zero buffer for clearing accumulator
-const zeros_buf = @zeros([dM]f32); [cite: 18]
+const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
 // =============================================================================
 // Global state
 // =============================================================================
 var send_col: i16 = 0;
-var proc_source: i16 = 0; [cite: 19]
-var proc_col: i16 = 0; [cite: 20]
+var proc_source: i16 = 0;
+var proc_col: i16 = 0;
 var total_reduces_done: i16 = 0;
 var gemv_active: bool = false;
-var stream_cols_ready: [8]i16 = @zeros([8]i16); [cite: 21]
+var stream_cols_ready: [8]i16 = @zeros([8]i16);
 
-// Task IDs
-const send_task_id: local_task_id = @get_local_task_id(16); [cite: 22]
+const send_task_id: local_task_id = @get_local_task_id(16);
 const send_done_task_id: local_task_id = @get_local_task_id(17);
 const gemv_task_id: local_task_id = @get_local_task_id(18);
-const reduce_done_task_id: local_task_id = @get_local_task_id(19); [cite: 23]
+const reduce_done_task_id: local_task_id = @get_local_task_id(19);
 
 // =============================================================================
 // Broadcast receive
 // =============================================================================
 fn handle_bcast(stream: i16, val: f32) void {
-    const col = b_buf_col[stream]; [cite: 24]
+    const col = b_buf_col[stream];
     const pos = b_buf_wpos[stream];
-    b_bufs[@as(u16, stream * dN_y * dH + col * dH + pos)] = val; [cite: 25]
+    b_bufs[@as(u16, stream * dN_y * dH + col * dH + pos)] = val;
     b_buf_wpos[stream] = pos + 1;
 
     if (pos + 1 == dH) {
-        b_buf_wpos[stream] = 0; [cite: 26]
+        b_buf_wpos[stream] = 0;
         b_buf_col[stream] = col + 1;
         stream_cols_ready[stream] += 1;
         try_start_gemv();
@@ -115,133 +111,132 @@ fn handle_bcast(stream: i16, val: f32) void {
 }
 
 fn try_start_gemv() void {
-    if (gemv_active) return; [cite: 27]
+    if (gemv_active) return;
     if (proc_source >= kernel_y_dim) return;
     if (stream_cols_ready[proc_source] > 0) {
-        gemv_active = true; [cite: 28]
+        gemv_active = true;
         @activate(gemv_task_id);
     }
 }
 
-task recv_bcast_0(val: f32) void { handle_bcast(0, val); } [cite: 29]
+task recv_bcast_0(val: f32) void { handle_bcast(0, val); }
 task recv_bcast_1(val: f32) void { handle_bcast(1, val); }
-task recv_bcast_2(val: f32) void { handle_bcast(2, val); } [cite: 30]
+task recv_bcast_2(val: f32) void { handle_bcast(2, val); }
 task recv_bcast_3(val: f32) void { handle_bcast(3, val); }
-task recv_bcast_4(val: f32) void { handle_bcast(4, val); } [cite: 31]
+task recv_bcast_4(val: f32) void { handle_bcast(4, val); }
 task recv_bcast_5(val: f32) void { handle_bcast(5, val); }
-task recv_bcast_6(val: f32) void { handle_bcast(6, val); } [cite: 32]
+task recv_bcast_6(val: f32) void { handle_bcast(6, val); }
 task recv_bcast_7(val: f32) void { handle_bcast(7, val); }
 
 // =============================================================================
-// GEMV task: process one buffered B column
+// GEMV task
 // =============================================================================
 task gemv_task() void {
-    const s = proc_source; [cite: 33]
-    var h: i16 = 0; [cite: 34]
+    const s = proc_source;
+    var h: i16 = 0;
     while (h < dH) : (h += 1) {
-        var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }); [cite: 35]
+        var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
         a_col_dsd = @increment_dsd_offset(a_col_dsd, h * dM, f32);
-        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + proc_col * dH + h)]); [cite: 36]
+        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + proc_col * dH + h)]);
     }
 
-    const global_col = s * dN_y + proc_col; [cite: 37]
+    const global_col = s * dN_y + proc_col;
     reduce_async(global_col);
 }
 
 // =============================================================================
-// Async Ring Reduction (Hardware bottleneck, must stay async)
+// Async Ring Reduction
 // =============================================================================
 fn reduce_async(global_col: i16) void {
-    const my_x = @as(i16, layout_mod.get_x_coord()); [cite: 38]
+    const my_x = @as(i16, layout_mod.get_x_coord());
     const fsum_pe = global_col / dN;
-    const isum_pe = (fsum_pe + 1) % kernel_x_dim; [cite: 39]
+    const isum_pe = (fsum_pe + 1) % kernel_x_dim;
     const local_c_col = global_col - fsum_pe * dN;
 
-    var c_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM }); [cite: 40]
+    var c_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
     c_col_dsd = @increment_dsd_offset(c_col_dsd, local_c_col * dM, f32);
 
-    const fabin_reduce = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq }); [cite: 41]
-    const fabin_flyover = @get_dsd(fabin_dsd, .{ .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq }); [cite: 42]
-    const fabout_reduce = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq }); [cite: 43]
-    const fabout_flyover = @get_dsd(fabout_dsd, .{ .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq }); [cite: 44]
+    const fabin_reduce = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq });
+    const fabin_flyover = @get_dsd(fabin_dsd, .{ .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq });
+    const fabout_reduce = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq });
+    const fabout_flyover = @get_dsd(fabout_dsd, .{ .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq });
 
     if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, accum_dsd, .{ .async = true, .activate = reduce_done_task_id }); [cite: 45]
+        @fmovs(c_col_dsd, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
     } else if (my_x == isum_pe) {
         if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, accum_dsd, .{ .async = true, .activate = reduce_done_task_id }); [cite: 46]
+            @fmovs(fabout_flyover, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
         } else {
-            @fmovs(fabout_reduce, accum_dsd, .{ .async = true, .activate = reduce_done_task_id }); [cite: 47]
+            @fmovs(fabout_reduce, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
         }
     } else if (my_x == fsum_pe) {
         if (my_x == 0) {
-            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id }); [cite: 48]
+            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
         } else {
-            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id }); [cite: 49]
+            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
         }
     } else {
         if (my_x == 0) {
-            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id }); [cite: 50]
+            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
         } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id }); [cite: 51]
+            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
         } else {
-            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id }); [cite: 52]
+            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
         }
     }
 }
 
 task reduce_done_task() void {
-    @fmovs(accum_dsd, zeros_dsd, .{}); [cite: 53]
-    stream_cols_ready[proc_source] -= 1; [cite: 54]
-    proc_source += 1; [cite: 55]
+    @fmovs(accum_dsd, zeros_dsd, .{});
+    stream_cols_ready[proc_source] -= 1;
+    proc_source += 1;
     if (proc_source >= kernel_y_dim) {
         proc_source = 0;
-        proc_col += 1; [cite: 56]
+        proc_col += 1;
     }
 
     total_reduces_done += 1;
     if (total_reduces_done == @as(i16, kernel_y_dim) * dN_y) {
-        terminate_kernel(); [cite: 57]
+        terminate_kernel();
         return;
     }
 
     gemv_active = false;
-    try_start_gemv(); [cite: 58]
+    try_start_gemv();
 }
 
 // =============================================================================
-// Send B Data: Synchronous fix to avoid microthread slot collisions
+// Synchronous Broadcast Send
 // =============================================================================
 task send_b_task() void {
-    send_col = 0; [cite: 59]
+    send_col = 0;
     send_next_column();
 }
 
 fn send_next_column() void {
-    if (send_col >= dN_y) { return; } [cite: 60]
+    if (send_col >= dN_y) { return; }
 
-    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }); [cite: 61]
+    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
     b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
 
     const out_dsd = @get_dsd(fabout_dsd, .{
         .fabric_color = my_bcast_color,
         .extent = dH,
         .output_queue = broadcast_oq,
-    }); [cite: 62]
+    });
 
-    // FIX: Perform synchronous move to free up microthread slots for reduction
     @fmovs(out_dsd, b_dsd, .{});
     @activate(send_done_task_id);
 }
 
 task send_done_task() void {
-    send_col += 1; [cite: 63]
+    send_col += 1;
     send_next_column();
 }
 
 fn broadcast_pe() void {
     start_timer();
-    @activate(send_task_id); [cite: 64]
+    @activate(send_task_id);
 }
 
 fn terminate_kernel() void {
@@ -250,20 +245,20 @@ fn terminate_kernel() void {
 }
 
 comptime {
-    @comptime_assert(@is_arch("wse2")); [cite: 65]
+    @comptime_assert(@is_arch("wse2"));
     @bind_data_task(recv_bcast_0, @get_data_task_id(bcast_color_0));
-    @bind_data_task(recv_bcast_1, @get_data_task_id(bcast_color_1)); [cite: 66]
+    @bind_data_task(recv_bcast_1, @get_data_task_id(bcast_color_1));
     if (kernel_y_dim > 2) { @bind_data_task(recv_bcast_2, @get_data_task_id(bcast_color_2)); }
-    if (kernel_y_dim > 3) { @bind_data_task(recv_bcast_3, @get_data_task_id(bcast_color_3)); } [cite: 67]
-    if (kernel_y_dim > 4) { @bind_data_task(recv_bcast_4, @get_data_task_id(bcast_color_4)); } [cite: 68]
-    if (kernel_y_dim > 5) { @bind_data_task(recv_bcast_5, @get_data_task_id(bcast_color_5)); } [cite: 69]
-    if (kernel_y_dim > 6) { @bind_data_task(recv_bcast_6, @get_data_task_id(bcast_color_6)); } [cite: 70]
-    if (kernel_y_dim > 7) { @bind_data_task(recv_bcast_7, @get_data_task_id(bcast_color_7)); } [cite: 71]
+    if (kernel_y_dim > 3) { @bind_data_task(recv_bcast_3, @get_data_task_id(bcast_color_3)); }
+    if (kernel_y_dim > 4) { @bind_data_task(recv_bcast_4, @get_data_task_id(bcast_color_4)); }
+    if (kernel_y_dim > 5) { @bind_data_task(recv_bcast_5, @get_data_task_id(bcast_color_5)); }
+    if (kernel_y_dim > 6) { @bind_data_task(recv_bcast_6, @get_data_task_id(bcast_color_6)); }
+    if (kernel_y_dim > 7) { @bind_data_task(recv_bcast_7, @get_data_task_id(bcast_color_7)); }
 
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(gemv_task, gemv_task_id);
-    @bind_local_task(reduce_done_task, reduce_done_task_id); [cite: 72]
+    @bind_local_task(reduce_done_task, reduce_done_task_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
