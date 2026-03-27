@@ -142,7 +142,7 @@ task relay_task(in_data: f32) void {
 // Send B Data
 // =============================================================================
 task send_b_task() void {
-    has_sent = true;
+    has_sent = true;
     send_col = 0;
     send_next_column();
 }
