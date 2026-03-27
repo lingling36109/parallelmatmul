@@ -258,7 +258,7 @@ fn terminate_kernel() void {
 // SAFE SECTION END
 
 comptime {
-  @comptime_assert(@is_arch("wse2"));
+  @comptime_assert(@is_arch("wse2") or @is_arch("wse3"));
 
   // Bind data task: broadcast_tx_color wavelets trigger recv_broadcast_task
   @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_tx_color));
