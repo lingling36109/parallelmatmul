@@ -85,8 +85,8 @@ layout {
   // Reduction color array for rotating assignment
   const reduce_colors = [3]color { reduce_A_color, reduce_B_color, reduce_C_color };
 
-  for (@as(i16, 0)..kernel_x_dim) |pe_x| {
-    for (@as(i16, 0)..kernel_y_dim) |pe_y| {
+  for (@range(i16, kernel_x_dim)) |pe_x| {
+    for (@range(i16, kernel_y_dim)) |pe_y| {
 
       // Rotate reduction colors by pe_x so adjacent PEs use different colors
       const tx_color = reduce_colors[pe_x % 3];
