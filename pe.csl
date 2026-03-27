@@ -87,9 +87,9 @@ const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = d
 var reduce_count: i16 = 0;   // total reductions completed
 var send_col: i16 = 0;       // B columns sent so far
 
-// Task IDs
-const send_task_id: local_task_id = @get_local_task_id(11);
-const send_done_task_id: local_task_id = @get_local_task_id(12);
+// Task IDs — use 16+ to avoid collision with broadcast data task IDs (8–15)
+const send_task_id: local_task_id = @get_local_task_id(16);
+const send_done_task_id: local_task_id = @get_local_task_id(17);
 
 // =============================================================================
 // Broadcast receive handler (shared logic for all streams)
