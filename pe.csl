@@ -74,6 +74,12 @@ const reduce_oq: output_queue = @get_output_queue(3);
 const reduce_iq: input_queue = @get_input_queue(2);
 
 // =============================================================================
+// Local task IDs
+// =============================================================================
+const finish_reduce_task_id:   local_task_id = @get_local_task_id(1);
+const send_switch_adv_task_id: local_task_id = @get_local_task_id(2);
+
+// =============================================================================
 // Storage (provided)
 // =============================================================================
 var A: [dM * dH]f32 = @zeros([dM * dH]f32);
@@ -186,14 +192,14 @@ fn reduce() void {
   if (reduce_count % kernel_x_dim == pe_x) {
     // FSUM: receive from ring + add local red_in → write to C
     const c_dest = @increment_dsd_offset(C_dsd, @as(u16, c_col_offset) * @as(u16, dM), f32);
-    @fadds(c_dest, reduce_in_dsd, red_in_dsd, .{ .async = true, .activate = finish_reduce });
+    @fadds(c_dest, reduce_in_dsd, red_in_dsd, .{ .async = true, .activate = finish_reduce_task_id });
     c_col_offset += 1;
   } else if ((reduce_count + 1) % kernel_x_dim == pe_x) {
     // ISUM: send red_in to fabric (initiates the ring)
-    @fmovs(reduce_out_dsd, red_in_dsd, .{ .async = true, .activate = finish_reduce });
+    @fmovs(reduce_out_dsd, red_in_dsd, .{ .async = true, .activate = finish_reduce_task_id });
   } else {
     // PSUM: receive from ring + add local red_in → forward on ring
-    @fadds(reduce_out_dsd, reduce_in_dsd, red_in_dsd, .{ .async = true, .activate = finish_reduce });
+    @fadds(reduce_out_dsd, reduce_in_dsd, red_in_dsd, .{ .async = true, .activate = finish_reduce_task_id });
   }
 }
 
@@ -239,7 +245,7 @@ fn broadcast_pe() void {
   });
 
   // Send all local B data on broadcast_rx_color → goes NORTH → color swap → SOUTH
-  @fmovs(broadcast_out_dsd, B_dsd, .{ .async = true, .activate = send_switch_adv });
+  @fmovs(broadcast_out_dsd, B_dsd, .{ .async = true, .activate = send_switch_adv_task_id });
 }
 
 // SAFE SECTION BEGIN
@@ -256,6 +262,10 @@ comptime {
 
   // Bind data task: broadcast_tx_color wavelets trigger recv_broadcast_task
   @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_tx_color));
+
+  // Bind local tasks to their IDs so .activate references resolve
+  @bind_local_task(finish_reduce,   finish_reduce_task_id);
+  @bind_local_task(send_switch_adv, send_switch_adv_task_id);
 
   // Block the reduce rx color so wavelets wait for DSD reads
   @block(reduce_rx_color);
