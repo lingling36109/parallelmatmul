@@ -76,8 +76,8 @@ const reduce_iq: input_queue = @get_input_queue(2);
 // =============================================================================
 // Local task IDs
 // =============================================================================
-const finish_reduce_task_id:   local_task_id = @get_local_task_id(1);
-const send_switch_adv_task_id: local_task_id = @get_local_task_id(2);
+const finish_reduce_task_id:   local_task_id = @get_local_task_id(8);
+const send_switch_adv_task_id: local_task_id = @get_local_task_id(9);
 
 // =============================================================================
 // Storage (provided)
