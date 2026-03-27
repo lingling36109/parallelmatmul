@@ -102,7 +102,6 @@ var stream_cols_ready: [8]i16 = @zeros([8]i16);
 const send_task_id: local_task_id = @get_local_task_id(16);
 const send_done_task_id: local_task_id = @get_local_task_id(17);
 const gemv_task_id: local_task_id = @get_local_task_id(18);
-const reduce_done_task_id: local_task_id = @get_local_task_id(19);
 
 // =============================================================================
 // Broadcast receive: buffer wavelets, trigger GEMV when column complete
@@ -157,15 +156,38 @@ task gemv_task() void {
         @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + proc_col * dH + h)]);
     }
 
-    // Launch async ring reduction
+    // Synchronous ring reduction (avoids microthread conflict with async sends)
     const global_col = s * dN_y + proc_col;
-    reduce_async(global_col);
+    reduce_sync(global_col);
+
+    // Clear accumulator
+    @fmovs(accum_dsd, zeros_dsd, .{});
+
+    // Consume one ready column from current source
+    stream_cols_ready[proc_source] -= 1;
+
+    // Advance processing state (round-robin: cycle sources for each col)
+    proc_source += 1;
+    if (proc_source >= kernel_y_dim) {
+        proc_source = 0;
+        proc_col += 1;
+    }
+
+    total_reduces_done += 1;
+    if (total_reduces_done == @as(i16, kernel_y_dim) * dN_y) {
+        terminate_kernel();
+        return;
+    }
+
+    // Try to start next GEMV
+    gemv_active = false;
+    try_start_gemv();
 }
 
 // =============================================================================
-// Async Ring Reduction
+// Synchronous Ring Reduction
 // =============================================================================
-fn reduce_async(global_col: i16) void {
+fn reduce_sync(global_col: i16) void {
     const my_x = @as(i16, layout_mod.get_x_coord());
 
     const fsum_pe = global_col / dN;
@@ -189,56 +211,28 @@ fn reduce_async(global_col: i16) void {
     });
 
     if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
+        @fmovs(c_col_dsd, accum_dsd, .{});
     } else if (my_x == isum_pe) {
         if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
+            @fmovs(fabout_flyover, accum_dsd, .{});
         } else {
-            @fmovs(fabout_reduce, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
+            @fmovs(fabout_reduce, accum_dsd, .{});
         }
     } else if (my_x == fsum_pe) {
         if (my_x == 0) {
-            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
+            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{});
         } else {
-            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
+            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{});
         }
     } else {
         if (my_x == 0) {
-            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
+            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{});
         } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
+            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{});
         } else {
-            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
+            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{});
         }
     }
-}
-
-// =============================================================================
-// Reduce done: clear accum, advance state, chain to next GEMV
-// =============================================================================
-task reduce_done_task() void {
-    // Clear accumulator
-    @fmovs(accum_dsd, zeros_dsd, .{});
-
-    // Consume one ready column from current source
-    stream_cols_ready[proc_source] -= 1;
-
-    // Advance processing state (round-robin: cycle sources for each col)
-    proc_source += 1;
-    if (proc_source >= kernel_y_dim) {
-        proc_source = 0;
-        proc_col += 1;
-    }
-
-    total_reduces_done += 1;
-    if (total_reduces_done == @as(i16, kernel_y_dim) * dN_y) {
-        terminate_kernel();
-        return;
-    }
-
-    // Try to start next GEMV
-    gemv_active = false;
-    try_start_gemv();
 }
 
 // =============================================================================
@@ -298,7 +292,6 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(gemv_task, gemv_task_id);
-    @bind_local_task(reduce_done_task, reduce_done_task_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
