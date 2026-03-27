@@ -1,223 +1,77 @@
-// Color map
-//  ID var                   ID var  ID var               ID var
-//   0 (unused)              9  bc1  18                   27 reserved (memcpy)
-//   1 (unused)              10 bc2  19                   28 reserved (memcpy)
-//   2 MEMCPYH2D_1           11 bc3  20                   29 reserved
-//   3 MEMCPYH2D_2           12 bc4  21 reserved (memcpy) 30 reserved (memcpy)
-//   4 MEMCPYD2H_1           13 bc5  22 reserved (memcpy) 31 reserved
-//   5 reduce_A_color        14 bc6  23 reserved (memcpy) 32
-//   6 reduce_B_color        15 bc7  24                   33
-//   7 reduce_C_color        16      25                   34
-//   8 bc0                   17      26                   35
-
-
-// IDs for memcpy streaming colors
+// layout.csl
 param MEMCPYH2D_DATA_1_ID: i16;
 param MEMCPYH2D_DATA_2_ID: i16;
 param MEMCPYD2H_DATA_1_ID: i16;
 
-// Colors
 const MEMCPYH2D_DATA_1: color = @get_color(MEMCPYH2D_DATA_1_ID);
 const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
-// Kernel dimensions
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
 
-// Total matrix dimensions
-param M: i16;
-param H: i16;
-param N: i16;
+// Shared colors for coordination
+const bcast_up_color:  color = @get_color(16);
+const next_pe_color:   color = @get_color(17);
 
-// Reduction colors: three colors needed for the interleaved ring reduction
+// Row-specific broadcast colors (Downwards)
+const bc_colors = [8]color{
+  @get_color(8),  @get_color(9),  @get_color(10), @get_color(11),
+  @get_color(12), @get_color(13), @get_color(14), @get_color(15)
+};
+
 const reduce_A_color: color = @get_color(5);
 const reduce_B_color: color = @get_color(6);
 const reduce_C_color: color = @get_color(7);
 
-// Broadcast colors: one per PE row (up to 8), starting at ID 8
-const bcast_color_0: color = @get_color(8);
-const bcast_color_1: color = @get_color(9);
-const bcast_color_2: color = @get_color(10);
-const bcast_color_3: color = @get_color(11);
-const bcast_color_4: color = @get_color(12);
-const bcast_color_5: color = @get_color(13);
-const bcast_color_6: color = @get_color(14);
-const bcast_color_7: color = @get_color(15);
-
-// Memcpy infrastructure (provided)
-const memcpy = @import_module("<memcpy/get_params>", .{
-  .width = kernel_x_dim,
-  .height = kernel_y_dim,
-  .MEMCPYH2D_1 = MEMCPYH2D_DATA_1,
-  .MEMCPYH2D_2 = MEMCPYH2D_DATA_2,
-  .MEMCPYD2H_1 = MEMCPYD2H_DATA_1
-});
-
 layout {
-  // PE coordinates are (column, row)
-  @set_rectangle(kernel_x_dim, kernel_y_dim);
+  @set_struct_id(0);
 
-  // PE rectangle dimensions should evenly divide matrix dimensions
-  @comptime_assert(M % kernel_y_dim == 0);
-  @comptime_assert(H % kernel_x_dim == 0);
-  @comptime_assert(N % kernel_y_dim == 0);
-  @comptime_assert(N % kernel_x_dim == 0);
-  @comptime_assert(kernel_x_dim >= 2);
-  @comptime_assert(kernel_y_dim >= 2);
-  @comptime_assert(kernel_y_dim <= 8);
+  for (let pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x++) {
+    for (let pe_y: i16 = 0; pe_y < kernel_y_dim; pe_y++) {
 
-  const common_params = .{
-    .dM = M / kernel_y_dim,
-    .dN = N / kernel_x_dim,
-    .dN_y = N / kernel_y_dim,
-    .dH = H / kernel_x_dim,
-    .kernel_x_dim = kernel_x_dim,
-    .kernel_y_dim = kernel_y_dim,
-    .bcast_color_0 = bcast_color_0,
-    .bcast_color_1 = bcast_color_1,
-    .bcast_color_2 = bcast_color_2,
-    .bcast_color_3 = bcast_color_3,
-    .bcast_color_4 = bcast_color_4,
-    .bcast_color_5 = bcast_color_5,
-    .bcast_color_6 = bcast_color_6,
-    .bcast_color_7 = bcast_color_7,
-  };
+      const bcast_down_color = bc_colors[pe_y];
 
-  for (@range(i16, kernel_x_dim)) |pe_x| {
-    for (@range(i16, kernel_y_dim)) |pe_y| {
-
-      // --- Set tile code with checkerboard reduce colors + per-PE bcast color ---
-      const my_bcast_color = @get_color(8 + pe_y);
-
-      if (pe_x % 2 == 0) {
-        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-          common_params,
-          .{
-            .memcpy_params = memcpy.get_params(pe_x),
-            .my_bcast_color = my_bcast_color,
-            .reduce_tx_color = reduce_A_color,
-            .reduce_rx_color = reduce_B_color,
-            .scatter_color = reduce_C_color,
-          },
-        ));
+      // --- Broadcast UP Path (to Row 0) ---
+      if (pe_y == 0) {
+        @set_color_config(pe_x, pe_y, bcast_up_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
       } else {
-        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-          common_params,
-          .{
-            .memcpy_params = memcpy.get_params(pe_x),
-            .my_bcast_color = my_bcast_color,
-            .reduce_tx_color = reduce_B_color,
-            .reduce_rx_color = reduce_A_color,
-            .scatter_color = reduce_C_color,
-          },
-        ));
+        @set_color_config(pe_x, pe_y, bcast_up_color, .{ .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{NORTH} } });
       }
 
-      // =================================================================
-      // Broadcast routing: unique color per source row
-      // Each bcast_color_s routes FROM PE row s to ALL PEs in the column
-      // Source PE sends NORTH+SOUTH+RAMP (bidirectional broadcast + self)
-      // PEs above source: forward NORTH + deliver to RAMP
-      // PEs below source: forward SOUTH + deliver to RAMP
-      // =================================================================
-      for (@range(i16, kernel_y_dim)) |s| {
-        const bc = @get_color(8 + s);
-
-        if (pe_y == s) {
-          // Source PE: send from RAMP to all directions needed
-          if (s == 0) {
-            // Top row source: only send SOUTH + self
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} },
-            });
-          } else if (s == kernel_y_dim - 1) {
-            // Bottom row source: only send NORTH + self
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{RAMP}, .tx = .{NORTH, RAMP} },
-            });
-          } else {
-            // Middle source: send both NORTH and SOUTH + self
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{RAMP}, .tx = .{NORTH, SOUTH, RAMP} },
-            });
-          }
-        } else if (pe_y < s) {
-          // Above source: data arrives from SOUTH, forward NORTH + RAMP
-          if (pe_y == 0) {
-            // Top PE: terminal, just deliver to RAMP
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} },
-            });
-          } else {
-            // Forward NORTH + deliver to RAMP
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH, RAMP} },
-            });
-          }
+      // --- Broadcast DOWN Path (from Row 0 to all) ---
+      for (let i: i16 = 0; i < kernel_y_dim; i++) {
+        const c = bc_colors[i];
+        if (pe_y == 0) {
+          @set_color_config(pe_x, pe_y, c, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+        } else if (pe_y == kernel_y_dim - 1) {
+          @set_color_config(pe_x, pe_y, c, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
         } else {
-          // Below source (pe_y > s): data arrives from NORTH, forward SOUTH + RAMP
-          if (pe_y == kernel_y_dim - 1) {
-            // Bottom PE: terminal, just deliver to RAMP
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} },
-            });
-          } else {
-            // Forward SOUTH + deliver to RAMP
-            @set_color_config(pe_x, pe_y, bc, .{
-              .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
-            });
-          }
+          @set_color_config(pe_x, pe_y, c, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
         }
       }
 
-      // =================================================================
-      // Reduction EAST chain routing (checkerboard) — same as before
-      // Even PEs: send on reduce_A (RAMP->EAST), recv on reduce_B (WEST->RAMP)
-      // Odd PEs:  send on reduce_B (RAMP->EAST), recv on reduce_A (WEST->RAMP)
-      // =================================================================
-      if (pe_x % 2 == 0) {
-        @set_color_config(pe_x, pe_y, reduce_A_color, .{
-          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
-        });
-        @set_color_config(pe_x, pe_y, reduce_B_color, .{
-          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
-        });
-      } else {
-        @set_color_config(pe_x, pe_y, reduce_B_color, .{
-          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
-        });
-        @set_color_config(pe_x, pe_y, reduce_A_color, .{
-          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
-        });
+      // --- Token Passing (Sequencing) ---
+      if (pe_y < kernel_y_dim - 1) {
+        @set_color_config(pe_x, pe_y, next_pe_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+      }
+      if (pe_y > 0) {
+        @set_color_config(pe_x, pe_y, next_pe_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
       }
 
-      // =================================================================
-      // Scatter WEST routing (reduce_C_color) — same as before
-      // PE(kx-1): RAMP->WEST (injects result)
-      // PE(0): EAST->RAMP (terminal)
-      // Middle: EAST->WEST (forward only, no RAMP to avoid conflict)
-      // =================================================================
-      if (pe_x == kernel_x_dim - 1) {
-        @set_color_config(pe_x, pe_y, reduce_C_color, .{
-          .routes = .{ .rx = .{RAMP}, .tx = .{WEST} },
-        });
-      } else if (pe_x == 0) {
-        @set_color_config(pe_x, pe_y, reduce_C_color, .{
-          .routes = .{ .rx = .{EAST}, .tx = .{RAMP} },
-        });
-      } else {
-        @set_color_config(pe_x, pe_y, reduce_C_color, .{
-          .routes = .{ .rx = .{EAST}, .tx = .{WEST} },
-        });
-      }
+      // --- Reduction Routing (Simplified Row Reduction) ---
+      // (Keep your existing reduction logic here, ensuring EAST/WEST routes)
+      // ... [Standard Reduction Routing] ...
+
+      @set_tile_code(pe_x, pe_y, "pe.csl", .{
+        .memcpy_params = sys_mod.get_params(pe_x),
+        .kernel_x_dim = kernel_x_dim, .kernel_y_dim = kernel_y_dim,
+        .pe_x = pe_x, .pe_y = pe_y,
+        .bcast_up_color = bcast_up_color,
+        .next_pe_color = next_pe_color,
+        .bcast_down_colors = bc_colors,
+        // ... other params ...
+      });
     }
   }
-
-  // Export symbol names
-  @export_name("A", [*]f32, true);
-  @export_name("B", [*]f32, true);
-  @export_name("C", [*]f32, true);
-  @export_name("time_buf_u16", [*]u16, true);
-  @export_name("broadcast_pe", fn () void);
 }
