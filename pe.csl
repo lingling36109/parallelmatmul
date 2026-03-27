@@ -156,32 +156,9 @@ task gemv_task() void {
         @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + proc_col * dH + h)]);
     }
 
-    // Synchronous ring reduction (avoids microthread conflict with async sends)
+    // Launch async ring reduction
     const global_col = s * dN_y + proc_col;
-    reduce_sync(global_col);
-
-    // Clear accumulator
-    @fmovs(accum_dsd, zeros_dsd, .{});
-
-    // Consume one ready column from current source
-    stream_cols_ready[proc_source] -= 1;
-
-    // Advance processing state (round-robin: cycle sources for each col)
-    proc_source += 1;
-    if (proc_source >= kernel_y_dim) {
-        proc_source = 0;
-        proc_col += 1;
-    }
-
-    total_reduces_done += 1;
-    if (total_reduces_done == @as(i16, kernel_y_dim) * dN_y) {
-        terminate_kernel();
-        return;
-    }
-
-    // Try to start next GEMV
-    gemv_active = false;
-    try_start_gemv();
+    reduce_async(global_col);
 }
 
 // =============================================================================
