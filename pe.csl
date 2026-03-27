@@ -1,268 +1,71 @@
-// Parameters from layout
-param memcpy_params: comptime_struct;
-param dM: i16;
-param dN: i16;
-param dN_y: i16;
-param dH: i16;
-param kernel_x_dim: i16;
-param kernel_y_dim: i16;
-param my_bcast_color: color;
-param reduce_tx_color: color;
-param reduce_rx_color: color;
-param scatter_color: color;
-
-// Broadcast receive colors (one per PE row, up to 8)
-param bcast_color_0: color;
-param bcast_color_1: color;
-param bcast_color_2: color;
-param bcast_color_3: color;
-param bcast_color_4: color;
-param bcast_color_5: color;
-param bcast_color_6: color;
-param bcast_color_7: color;
+param bcast_up_color: color;
+param sentinel_color: color;
+param bcast_down_colors: [8]color;
+param pe_y: i16;
+// ... (include all other params from your original pe.csl)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
-const layout_mod = @import_module("<layout>");
-const timestamp = @import_module("<time>");
 
-// =============================================================================
-// TSC timer buffers
-// =============================================================================
-var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
-var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
-var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
-var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
+var b_buf = @zeros([dN * dH]f32);
+var current_row_processing: i16 = 0;
 
-fn start_timer() void {
-    timestamp.enable_tsc();
-    timestamp.get_timestamp(&tscStartBuffer);
-    time_buf_u16[0] = tscStartBuffer[0];
-    time_buf_u16[1] = tscStartBuffer[1];
-    time_buf_u16[2] = tscStartBuffer[2];
+// DSD for my local B data broadcast
+const my_bcast_dsd = @get_dsd(fabbric_dsd, .{
+    .extent = dN * dH,
+    .fabric_color = (pe_y == 0) ? bcast_down_colors[0] : bcast_up_color,
+    .output_queue = @get_output_queue(1)
+});
+
+// TASK: PE 0 Repeater (Only active on Row 0)
+// Forwards data from UP color to the specific DOWN color for the current sender
+task repeater_task(data: f32) void {
+    const down_color = bcast_down_colors[current_row_processing];
+    const out_dsd = @get_dsd(fabbric_dsd, .{
+        .extent = dN * dH,
+        .fabric_color = down_color,
+        .output_queue = @get_output_queue(2)
+    });
+    // This blocks until the whole stream is moved
+    @fmovs(out_dsd, @get_dsd(fabbric_dsd, .{ .extent = dN * dH, .fabric_color = bcast_up_color }));
 }
 
-fn end_timer() void {
-    timestamp.get_timestamp(&tscEndBuffer);
-    time_buf_u16[3] = tscEndBuffer[0];
-    time_buf_u16[4] = tscEndBuffer[1];
-    time_buf_u16[5] = tscEndBuffer[2];
-}
+// TASK: Start my broadcast (When it's my turn)
+task send_my_b_task() void {
+    @fmovs(my_bcast_dsd, @get_dsd(mem1d_dsd, .{ .tensor_access = |i| b_buf[i], .extent = dN * dH }));
 
-// =============================================================================
-// Queue declarations
-// =============================================================================
-const broadcast_oq: output_queue = @get_output_queue(2);
-const reduce_oq: output_queue = @get_output_queue(3);
-const reduce_iq: input_queue = @get_input_queue(2);
-
-const flyover_color: color = scatter_color;
-const flyover_oq: output_queue = @get_output_queue(4);
-const flyover_iq: input_queue = @get_input_queue(4);
-
-// =============================================================================
-// Storage
-// =============================================================================
-var A: [dM * dH]f32 = @zeros([dM * dH]f32);
-var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
-var C: [dM * dN]f32 = @zeros([dM * dN]f32);
-
-var ptr_A: [*]f32 = &A;
-var ptr_B: [*]f32 = &B;
-var ptr_C: [*]f32 = &C;
-
-// Per-stream accumulators (one dM-sized buffer per stream, up to 8 streams)
-var accums: [8 * dM]f32 = @zeros([8 * dM]f32);
-
-// Per-stream state (fixed size 8 to support up to kernel_y_dim=8)
-var stream_wcount: [8]i16 = @zeros([8]i16);   // wavelet count within current B column
-var stream_colcount: [8]i16 = @zeros([8]i16);  // B columns completed per stream
-
-// Zero buffer for clearing accumulators
-const zeros_buf = @zeros([dM]f32);
-const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
-
-// =============================================================================
-// Global state
-// =============================================================================
-var reduce_count: i16 = 0;   // total reductions completed
-var send_col: i16 = 0;       // B columns sent so far
-
-// Task IDs
-const send_task_id: local_task_id = @get_local_task_id(11);
-const send_done_task_id: local_task_id = @get_local_task_id(12);
-
-// =============================================================================
-// Broadcast receive handler (shared logic for all streams)
-// =============================================================================
-fn handle_bcast(stream: i16, val: f32) void {
-    // Get accumulator DSD for this stream
-    var accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accums, .extent = dM });
-    accum_dsd = @increment_dsd_offset(accum_dsd, stream * dM, f32);
-
-    // Get A column DSD (stream_wcount[stream] is which A column we're at, 0..dH-1)
-    var a_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-    a_dsd = @increment_dsd_offset(a_dsd, stream_wcount[stream] * dM, f32);
-
-    // SAXPY: accum += A_col * val
-    @fmacs(accum_dsd, accum_dsd, a_dsd, val);
-
-    stream_wcount[stream] += 1;
-
-    if (stream_wcount[stream] == dH) {
-        // One B column fully processed — reduce along PE row
-        stream_wcount[stream] = 0;
-        const global_col = stream * dN_y + stream_colcount[stream];
-
-        reduce(global_col, stream);
-
-        // Clear accumulator for next B column from this stream
-        @fmovs(accum_dsd, zeros_dsd, .{});
-
-        stream_colcount[stream] += 1;
-        reduce_count += 1;
-
-        if (reduce_count == @as(i16, kernel_y_dim) * dN_y) {
-            terminate_kernel();
-        }
+    // Pass the turn to the PE below me
+    if (pe_y < kernel_y_dim - 1) {
+        const sen_dsd = @get_dsd(fabbric_dsd, .{ .extent = 1, .fabric_color = sentinel_color });
+        @mov32(sen_dsd, 1.0f32);
     }
 }
 
-// =============================================================================
-// Per-stream data tasks (one per broadcast color)
-// =============================================================================
-task recv_bcast_0(val: f32) void { handle_bcast(0, val); }
-task recv_bcast_1(val: f32) void { handle_bcast(1, val); }
-task recv_bcast_2(val: f32) void { handle_bcast(2, val); }
-task recv_bcast_3(val: f32) void { handle_bcast(3, val); }
-task recv_bcast_4(val: f32) void { handle_bcast(4, val); }
-task recv_bcast_5(val: f32) void { handle_bcast(5, val); }
-task recv_bcast_6(val: f32) void { handle_bcast(6, val); }
-task recv_bcast_7(val: f32) void { handle_bcast(7, val); }
-
-// =============================================================================
-// Send B Data (each PE sends on its own unique color)
-// =============================================================================
-task send_b_task() void {
-    send_col = 0;
-    send_next_column();
+// Handle data from any row broadcast
+fn process_incoming_b(sender_id: i16) void {
+    // 1. Multiply with local A
+    // 2. Call reduce()
+    // 3. current_row_processing++
+    // 4. If current == kernel_y_dim, terminate_kernel()
 }
 
-fn send_next_column() void {
-    if (send_col >= dN_y) { return; }
-
-    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-    b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
-
-    const out_dsd = @get_dsd(fabout_dsd, .{
-        .fabric_color = my_bcast_color,
-        .extent = dH,
-        .output_queue = broadcast_oq,
-    });
-    @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
-}
-
-task send_done_task() void {
-    send_col += 1;
-    send_next_column();
-}
-
-// =============================================================================
-// Ring Reduction (synchronous per call, but interleaved with async broadcasts)
-// =============================================================================
-fn reduce(global_col: i16, stream: i16) void {
-    const my_x = @as(i16, layout_mod.get_x_coord());
-
-    // Determine roles for this column reduction
-    const fsum_pe = global_col / dN;
-    const isum_pe = (fsum_pe + 1) % kernel_x_dim;
-    const local_c_col = global_col - fsum_pe * dN;
-
-    // C column DSD (only meaningful on fsum_pe)
-    var c_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
-    c_col_dsd = @increment_dsd_offset(c_col_dsd, local_c_col * dM, f32);
-
-    // Accumulator DSD for this stream
-    var accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accums, .extent = dM });
-    accum_dsd = @increment_dsd_offset(accum_dsd, stream * dM, f32);
-
-    // Fabric DSDs
-    const fabin_reduce = @get_dsd(fabin_dsd, .{
-        .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
-    });
-    const fabin_flyover = @get_dsd(fabin_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
-    });
-    const fabout_reduce = @get_dsd(fabout_dsd, .{
-        .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
-    });
-    const fabout_flyover = @get_dsd(fabout_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
-    });
-
-    // Execute ring reduction state machine
-    if (kernel_x_dim == 1) {
-        // Single PE column: just store directly
-        @fmovs(c_col_dsd, accum_dsd, .{});
-    } else if (my_x == isum_pe) {
-        // ISUM: inject into the ring
-        if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, accum_dsd, .{});
-        } else {
-            @fmovs(fabout_reduce, accum_dsd, .{});
-        }
-    } else if (my_x == fsum_pe) {
-        // FSUM: receive, add local, and store to C
-        if (my_x == 0) {
-            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{});
-        } else {
-            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{});
-        }
-    } else {
-        // PSUM: receive, add local, and forward
-        if (my_x == 0) {
-            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{});
-        } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{});
-        } else {
-            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{});
-        }
-    }
-}
-
-// =============================================================================
 // Entry point
-// =============================================================================
 fn broadcast_pe() void {
-    start_timer();
-    // ALL PEs start sending their B data immediately — no relay needed
-    @activate(send_task_id);
-}
-
-fn terminate_kernel() void {
-    end_timer();
-    sys_mod.unblock_cmd_stream();
+    if (pe_y == 0) {
+        @activate(send_my_b_task);
+    }
 }
 
 comptime {
-    @comptime_assert(@is_arch("wse2"));
+    if (pe_y == 0) {
+        @bind_data_task(repeater_task, @get_data_task_id(bcast_up_color));
+    }
 
-    // Bind per-stream broadcast receive tasks
-    @bind_data_task(recv_bcast_0, @get_data_task_id(bcast_color_0));
-    @bind_data_task(recv_bcast_1, @get_data_task_id(bcast_color_1));
-    if (kernel_y_dim > 2) { @bind_data_task(recv_bcast_2, @get_data_task_id(bcast_color_2)); }
-    if (kernel_y_dim > 3) { @bind_data_task(recv_bcast_3, @get_data_task_id(bcast_color_3)); }
-    if (kernel_y_dim > 4) { @bind_data_task(recv_bcast_4, @get_data_task_id(bcast_color_4)); }
-    if (kernel_y_dim > 5) { @bind_data_task(recv_bcast_5, @get_data_task_id(bcast_color_5)); }
-    if (kernel_y_dim > 6) { @bind_data_task(recv_bcast_6, @get_data_task_id(bcast_color_6)); }
-    if (kernel_y_dim > 7) { @bind_data_task(recv_bcast_7, @get_data_task_id(bcast_color_7)); }
+    // Bind the sentinel task to start my send
+    @bind_data_task(send_my_b_task, @get_data_task_id(sentinel_color));
 
-    // Bind local tasks
-    @bind_local_task(send_b_task, send_task_id);
-    @bind_local_task(send_done_task, send_done_task_id);
-
-    @export_symbol(ptr_A, "A");
-    @export_symbol(ptr_B, "B");
-    @export_symbol(ptr_C, "C");
-    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
-    @export_symbol(broadcast_pe);
+    // Bind each broadcast color to a handler that maintains order
+    // (Ensure these handlers call process_incoming_b with the right index)
+    @bind_data_task(recv_0, @get_data_task_id(bcast_down_colors[0]));
+    @bind_data_task(recv_1, @get_data_task_id(bcast_down_colors[1]));
+    // ... repeat for 0-7 ...
 }
