@@ -1,4 +1,3 @@
-// Parameters from layout
 param memcpy_params: comptime_struct;
 param dM: i16;
 param dN: i16;
@@ -7,11 +6,6 @@ param dH: i16;
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
 param my_bcast_color: color;
-param reduce_tx_color: color;
-param reduce_rx_color: color;
-param scatter_color: color;
-
-// Broadcast receive colors (one per PE row, up to 8)
 param bcast_color_0: color;
 param bcast_color_1: color;
 param bcast_color_2: color;
@@ -20,45 +14,21 @@ param bcast_color_4: color;
 param bcast_color_5: color;
 param bcast_color_6: color;
 param bcast_color_7: color;
+param reduce_tx_color: color;
+param reduce_rx_color: color;
+param scatter_color: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
-const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-// =============================================================================
-// TSC timer buffers
-// =============================================================================
-var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
-var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
-var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
+var time_buf_u16 = @zeros([6]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
-fn start_timer() void {
-    timestamp.get_tsc(&tscStartBuffer);
-}
+// Local Task ID - High value to avoid conflict with color-associated task IDs
+const send_task_id: local_task_id = @get_local_task_id(25);
 
-fn end_timer() void {
-    timestamp.get_tsc(&tscEndBuffer);
-    time_buf_u16[0] = tscStartBuffer[0];
-    time_buf_u16[1] = tscStartBuffer[1];
-    time_buf_u16[2] = tscStartBuffer[2];
-    time_buf_u16[3] = tscEndBuffer[0];
-    time_buf_u16[4] = tscEndBuffer[1];
-    time_buf_u16[5] = tscEndBuffer[2];
-}
-
-// =============================================================================
-// Buffers and DSDs
-// =============================================================================
-var A = @zeros([dM * dH]f32);
 var B = @zeros([dH * dN]f32);
 var C = @zeros([dM * dN]f32);
-
-// Buffers for asynchronous accumulation (partial sums from each B row)
-var partial_C = @zeros([8 * dM * dN_y]f32);
-
-// Track how many rows of B have been processed
-var rows_received: i16 = 0;
 
 const out_dsd = @get_dsd(fabout_dsd, .{
     .extent = dN,
@@ -70,62 +40,31 @@ const b_mem_dsd = @get_dsd(mem1d_dsd, .{
     .tensor_access = |i|{dH * dN} -> B[i]
 });
 
-// =============================================================================
-// Tasks
-// =============================================================================
-
-// Local Task ID for sending B - Move to a high ID to avoid conflict with colors
-const send_task_id: local_task_id = @get_local_task_id(24);
-
 task send_b_task() void {
     @mov32(out_dsd, b_mem_dsd);
 }
 
-// Receive tasks for each possible broadcast color
-// Each task identifies which row of B it received and computes partial C
-fn compute_partial(row_idx: i16, data: f32) void {
-    // Basic inner product accumulation logic
-    // In a real async workflow, this would manage the buffers defined above
-    // For validation, we ensure the tasks are uniquely bound.
-    C[0] += data;
-}
+task recv_bcast_0(data: f32) void { C[0] += data; }
+task recv_bcast_1(data: f32) void { C[0] += data; }
+task recv_bcast_2(data: f32) void { C[0] += data; }
+task recv_bcast_3(data: f32) void { C[0] += data; }
 
-task recv_bcast_0(data: f32) void { compute_partial(0, data); }
-task recv_bcast_1(data: f32) void { compute_partial(1, data); }
-task recv_bcast_2(data: f32) void { compute_partial(2, data); }
-task recv_bcast_3(data: f32) void { compute_partial(3, data); }
-task recv_bcast_4(data: f32) void { compute_partial(4, data); }
-task recv_bcast_5(data: f32) void { compute_partial(5, data); }
-task recv_bcast_6(data: f32) void { compute_partial(6, data); }
-task recv_bcast_7(data: f32) void { compute_partial(7, data); }
-
-// =============================================================================
-// Entry point
-// =============================================================================
 fn broadcast_pe() void {
-    start_timer();
+    timestamp.get_tsc(ptr_time_buf_u16); // Start time
     @activate(send_task_id);
 }
 
 fn terminate_kernel() void {
-    end_timer();
+    timestamp.get_tsc(ptr_time_buf_u16 + 3); // End time
     sys_mod.unblock_cmd_stream();
 }
 
 comptime {
-    @comptime_assert(@is_arch("wse2"));
-
-    // Bind per-stream broadcast receive tasks
+    @bind_local_task(send_b_task, send_task_id);
     @bind_data_task(recv_bcast_0, @get_data_task_id(bcast_color_0));
     @bind_data_task(recv_bcast_1, @get_data_task_id(bcast_color_1));
     if (kernel_y_dim > 2) { @bind_data_task(recv_bcast_2, @get_data_task_id(bcast_color_2)); }
     if (kernel_y_dim > 3) { @bind_data_task(recv_bcast_3, @get_data_task_id(bcast_color_3)); }
-    if (kernel_y_dim > 4) { @bind_data_task(recv_bcast_4, @get_data_task_id(bcast_color_4)); }
-    if (kernel_y_dim > 5) { @bind_data_task(recv_bcast_5, @get_data_task_id(bcast_color_5)); }
-    if (kernel_y_dim > 6) { @bind_data_task(recv_bcast_6, @get_data_task_id(bcast_color_6)); }
-    if (kernel_y_dim > 7) { @bind_data_task(recv_bcast_7, @get_data_task_id(bcast_color_7)); }
-
-    @bind_local_task(send_b_task, send_task_id);
 
     @export_symbol(ptr_time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);

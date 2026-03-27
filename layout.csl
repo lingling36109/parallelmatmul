@@ -10,26 +10,22 @@
 //   7 reduce_C_color        16      25                   34
 //   8 bc0                   17      26                   35
 
-
-// IDs for memcpy streaming colors
+// Color map IDs (8-15 reserved for broadcast rows)
 param MEMCPYH2D_DATA_1_ID: i16;
 param MEMCPYH2D_DATA_2_ID: i16;
 param MEMCPYD2H_DATA_1_ID: i16;
 
-// Colors
 const MEMCPYH2D_DATA_1: color = @get_color(MEMCPYH2D_DATA_1_ID);
 const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
-// Kernel dimensions
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
-
-// Matrix dimensions
 param M: i16;
 param H: i16;
 param N: i16;
 
+// Broadcast colors
 const x_color_0: color = @get_color(8);
 const x_color_1: color = @get_color(9);
 const x_color_2: color = @get_color(10);
@@ -52,18 +48,21 @@ const memcpy = @import_module("<memcpy/get_params>", .{
 });
 
 layout {
-    @set_struct_id(0);
-
     for (@range(i16, kernel_x_dim)) |pe_x| {
         for (@range(i16, kernel_y_dim)) |pe_y| {
+            // Each PE in a row broadcasts on its specific color
             const my_bcast_color = @get_color(8 + pe_y);
 
-            // Compute routing: All PEs in a column receive from all row colors
-            // This enables the "Simultaneous Broadcast" from your plan
+            // Configure all PEs to receive from all possible row broadcasts
+            // Note: we only configure routes for colors that might be used
             @set_color_config(pe_x, pe_y, x_color_0, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
             @set_color_config(pe_x, pe_y, x_color_1, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_color_2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
-            @set_color_config(pe_x, pe_y, x_color_3, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            if (kernel_y_dim > 2) {
+                @set_color_config(pe_x, pe_y, x_color_2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            }
+            if (kernel_y_dim > 3) {
+                @set_color_config(pe_x, pe_y, x_color_3, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
+            }
 
             @set_tile_code(pe_x, pe_y, "pe.csl", .{
                 .memcpy_params = memcpy.get_params(pe_x),
@@ -89,6 +88,5 @@ layout {
         }
     }
 
-    // Explicitly set the host-to-device and device-to-host regions
     @set_comm_master_reg_region(0, 0, kernel_x_dim, kernel_y_dim);
 }
