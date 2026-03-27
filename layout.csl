@@ -82,79 +82,129 @@ layout {
     .broadcast_rx_color = broadcast_rx_color,
   };
 
-  // Reduction color array for rotating assignment
-  const reduce_colors = [3]color { reduce_A_color, reduce_B_color, reduce_C_color };
+  // ===========================================================================
+  // TODO: Implement tile code assignment and fabric routing.
+  //
+  // For each PE(pe_x, pe_y) you must:
+  //
+  //  1) Configure broadcast routes using @set_color_config.
+  //     Broadcasting sends B-column data from each PE in turn down the
+  //     Y-column. Use color swap or an additional PE to change the color.
+  //     Hint: if you need to send SWITCH_ADV signals on the same color,
+  //     also RAMP needs swap_x and swap_y to be enabled.
+  //
+  //  2) Upon receiving a broadcast wavelet, a PE should trigger a SAXPY operation
+  //     to update its partial C column.
+  //
+  //  2) Configure reduction ring routes using @set_color_config. Remember that colors
+  //     need to be alternated.
+  //     Each PE needs 3 colors:
+  //       reduce_tx_color: RAMP -> fabric (the PE's own send)
+  //       reduce_rx_color: fabric -> RAMP (the PE's own receive)
+  //       flyover color: passthrough for the other ring traffic
+  //
+  // Useful API:
+  //   @set_tile_code(pe_x, pe_y, "pe.csl", params_struct)
+  //   @set_color_config(pe_x, pe_y, color, .{ .routes = .{...}, .switches = .{...} })
+  //   @concat_structs(struct1, struct2)
+  //   memcpy.get_params(pe_x)
+  //   Directions: NORTH, SOUTH, EAST, WEST, RAMP
+  // ===========================================================================
+  //
+
+  // Reduction: 2-color checkerboard EAST chain + 1 scatter color WEST
+  // reduce_A_color / reduce_B_color: checkerboard for EAST accumulation
+  // reduce_C_color: scatter result WEST from PE(kx-1) to FSUM PE
 
   for (@range(i16, kernel_x_dim)) |pe_x| {
     for (@range(i16, kernel_y_dim)) |pe_y| {
 
-      // Rotate reduction colors by pe_x so adjacent PEs use different colors
-      const tx_color = reduce_colors[pe_x % 3];
-      const rx_color = reduce_colors[(pe_x + 1) % 3];
-      const flyover  = reduce_colors[(pe_x + 2) % 3];
-
-      // Assign tile code with per-PE parameters
-      @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-        common_params,
-        .{
-          .memcpy_params = memcpy.get_params(pe_x),
-          .reduce_tx_color = tx_color,
-          .reduce_rx_color = rx_color,
-        },
-      ));
-
-      // ----- Broadcast routing (Y-dimension, colors 0 and 1) -----
-
-      if (pe_y == 0) {
-        // Head PE: color swap reflects broadcast_rx_color (sent NORTH)
-        // back as broadcast_tx_color (going SOUTH)
-        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
-          .routes = .{ .rx = .{ RAMP }, .tx = .{ NORTH }, .color_swap_y = true },
-        });
-        // broadcast_tx_color: receive from NORTH (reflected), send to RAMP + SOUTH
-        // Switch: pos0 = no SOUTH (head consumes only), pos1 = forward SOUTH
-        // ring_mode cycles through positions for each PE's broadcast turn
-        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
-          .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP, SOUTH }, .color_swap_y = true },
-          .switches = .{
-            .pos1 = .{ .tx = SOUTH },
-            .current_switch_pos = 0,
-            .ring_mode = true,
+      // --- Set tile code with checkerboard reduce colors ---
+      if (pe_x % 2 == 0) {
+        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+          common_params,
+          .{
+            .memcpy_params = memcpy.get_params(pe_x),
+            .reduce_tx_color = reduce_A_color,
+            .reduce_rx_color = reduce_B_color,
+            .scatter_color = reduce_C_color,
           },
-        });
+        ));
       } else {
-        // Non-head PEs: send on broadcast_rx_color goes NORTH
-        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
-          .routes = .{ .rx = .{ RAMP }, .tx = .{ NORTH } },
-        });
-
-        if (pe_y < kernel_y_dim - 1) {
-          // Middle PE: receive from NORTH, deliver to RAMP and forward SOUTH
-          @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
-            .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP, SOUTH } },
-          });
-        } else {
-          // Bottom PE: terminal, receive from NORTH, deliver to RAMP only
-          @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
-            .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } },
-          });
-        }
+        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+          common_params,
+          .{
+            .memcpy_params = memcpy.get_params(pe_x),
+            .reduce_tx_color = reduce_B_color,
+            .reduce_rx_color = reduce_A_color,
+            .scatter_color = reduce_C_color,
+          },
+        ));
       }
 
-      // ----- Reduction ring routing (X-dimension, colors 5, 6, 7) -----
+      // --- Broadcast routing ---
+      // broadcast_tx_color: PEs y>0 send B data NORTH to PE(x,0)
+      // broadcast_rx_color: PE(x,0) relays data SOUTH to all PEs (software relay)
 
-      // tx_color: PE sends its data EAST
-      @set_color_config(pe_x, pe_y, tx_color, .{
-        .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
-      });
-      // rx_color: PE receives accumulated data from WEST
-      @set_color_config(pe_x, pe_y, rx_color, .{
-        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
-      });
-      // flyover: passthrough for the other ring traffic
-      @set_color_config(pe_x, pe_y, flyover, .{
-        .routes = .{ .rx = .{ EAST }, .tx = .{ WEST } },
-      });
+      if (pe_y == 0) {
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} },
+        });
+      } else if (pe_y == kernel_y_dim - 1) {
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
+        });
+      }
+
+      // --- Reduction EAST chain routing (checkerboard) ---
+      // Even PEs: send on reduce_A (RAMP->EAST), recv on reduce_B (WEST->RAMP)
+      // Odd PEs:  send on reduce_B (RAMP->EAST), recv on reduce_A (WEST->RAMP)
+      if (pe_x % 2 == 0) {
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
+        });
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{
+          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
+        });
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{
+          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
+        });
+      }
+
+      // --- Scatter WEST routing (reduce_C_color) ---
+      // PE(kx-1): RAMP->WEST (injects result)
+      // PE(0): EAST->RAMP (terminal)
+      // Middle: EAST->WEST+RAMP (forward and deliver)
+      if (pe_x == kernel_x_dim - 1) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{WEST} },
+        });
+      } else if (pe_x == 0) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{EAST}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{EAST}, .tx = .{WEST} }, // Removed RAMP
+        });
+      }
     }
   }
 
