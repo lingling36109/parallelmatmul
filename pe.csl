@@ -224,7 +224,7 @@ task send_switch_adv() void {
     .fabric_color = broadcast_rx_color,
     .output_queue = broadcast_oq,
   });
-  @mov32(switch_dsd, switch_payload, .{ .async = true });
+  @mov32(switch_dsd, switch_payload);
 }
 
 // =============================================================================
