@@ -6,19 +6,33 @@ param dN_y: i16;
 param dH: i16;
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
-param broadcast_tx_color: color;
-param broadcast_rx_color: color;
-param reduce_tx_color: color;
-param reduce_rx_color: color;
-param scatter_color: color; // Passed from layout, used as flyover
+param my_bcast_color: color;
+param reduce_0_tx_color: color;
+param reduce_0_rx_color: color;
+param reduce_0_flyover_color: color;
+param reduce_1_tx_color: color;
+param reduce_1_rx_color: color;
+param reduce_1_flyover_color: color;
+
+// Broadcast receive colors (one per PE row, up to 8)
+param bcast_color_0: color;
+param bcast_color_1: color;
+param bcast_color_2: color;
+param bcast_color_3: color;
+param bcast_color_4: color;
+param bcast_color_5: color;
+param bcast_color_6: color;
+param bcast_color_7: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
-const tile_config = @import_module("<tile_config>");
-const prt = @import_module("<simprint>");
 const timestamp = @import_module("<time>");
 
+const STREAM_WINDOW: i16 = 2;
+
+// =============================================================================
 // TSC timer buffers
+// =============================================================================
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
@@ -39,23 +53,20 @@ fn end_timer() void {
     time_buf_u16[5] = tscEndBuffer[2];
 }
 
-fn print_id() void {
-    const px: u16 = layout_mod.get_x_coord();
-    const py: u16 = layout_mod.get_y_coord();
-    prt.fmt_no_nl("P{d}{d}: ", .{px, py});
-}
-
 // =============================================================================
 // Queue declarations
 // =============================================================================
 const broadcast_oq: output_queue = @get_output_queue(2);
-const reduce_oq: output_queue = @get_output_queue(3);
-const reduce_iq: input_queue = @get_input_queue(2);
 
-// Rename scatter to flyover for mental clarity
-const flyover_color: color = scatter_color;
-const flyover_oq: output_queue = @get_output_queue(4);
-const flyover_iq: input_queue = @get_input_queue(4);
+const reduce_0_oq: output_queue = @get_output_queue(3);
+const reduce_0_iq: input_queue = @get_input_queue(2);
+const flyover_0_oq: output_queue = @get_output_queue(4);
+const flyover_0_iq: input_queue = @get_input_queue(4);
+
+const reduce_1_oq: output_queue = @get_output_queue(5);
+const reduce_1_iq: input_queue = @get_input_queue(3);
+const flyover_1_oq: output_queue = @get_output_queue(6);
+const flyover_1_iq: input_queue = @get_input_queue(5);
 
 // =============================================================================
 // Storage
@@ -68,77 +79,191 @@ var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-var red_in: [dM]f32 = @zeros([dM]f32);
-
-// =============================================================================
-// DSDs
-// =============================================================================
-var A_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
-const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
+var accums: [2 * dM]f32 = @zeros([2 * dM]f32);
+var lane_wcount: [2]i16 = @zeros([2]i16);
+var lane_colcount: [2]i16 = @zeros([2]i16);
+var lane_stream: [2]i16 = @zeros([2]i16);
+var source_done: [8]u16 = @zeros([8]u16);
 
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
 // =============================================================================
-// State variables
+// Global state
 // =============================================================================
-var current_row: i16 = 0;
-var reduce_col: i16 = 0;
-var fsum_count: i16 = 0;
-var recv_count: i16 = 0;
+var reduce_count: i16 = 0;
 var has_sent: bool = false;
 var send_col: i16 = 0;
 
 // Task IDs
-const recv_task_id: data_task_id = @get_data_task_id(broadcast_rx_color);
-const relay_task_id: data_task_id = @get_data_task_id(broadcast_tx_color);
-const send_task_id: local_task_id = @get_local_task_id(11);
-const send_done_task_id: local_task_id = @get_local_task_id(12);
+const send_task_id: local_task_id = @get_local_task_id(16);
+const send_done_task_id: local_task_id = @get_local_task_id(17);
 
-// =============================================================================
-// Broadcast Receive Task
-// =============================================================================
-task recv_broadcast_task(in_data: f32) void {
-    @fmacs(red_in_dsd, red_in_dsd, A_dsd, in_data);
-    A_dsd = @increment_dsd_offset(A_dsd, dM, f32);
-    current_row += 1;
-    recv_count += 1;
-    if (current_row == dH) {
-        current_row = 0;
-        A_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+fn maybe_activate_sender(completed_stream: i16) void {
+    const my_y = @as(i16, layout_mod.get_y_coord());
+    const next_stream = completed_stream + STREAM_WINDOW;
 
-        // Completely synchronous reduction
-        reduce();
-    }
+    if (next_stream >= kernel_y_dim) { return; }
+    if (my_y != next_stream) { return; }
+    if (has_sent) { return; }
 
-    if (!has_sent) {
-        const my_y = layout_mod.get_y_coord();
-        const my_send_start = @as(i16, my_y) * dH * dN_y;
-        if (recv_count == my_send_start) {
-            @activate(send_task_id);
+    @activate(send_task_id);
+}
+
+fn reduce(lane: i16, global_col: i16) void {
+    const my_x = @as(i16, layout_mod.get_x_coord());
+    const fsum_pe = global_col / dN;
+    const isum_pe = (fsum_pe + 1) % kernel_x_dim;
+    const local_c_col = global_col - fsum_pe * dN;
+
+    var c_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
+    c_col_dsd = @increment_dsd_offset(c_col_dsd, local_c_col * dM, f32);
+
+    var accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accums, .extent = dM });
+    accum_dsd = @increment_dsd_offset(accum_dsd, lane * dM, f32);
+
+    if (lane == 0) {
+        const fabin_reduce = @get_dsd(fabin_dsd, .{
+            .fabric_color = reduce_0_rx_color,
+            .extent = dM,
+            .input_queue = reduce_0_iq,
+        });
+        const fabin_flyover = @get_dsd(fabin_dsd, .{
+            .fabric_color = reduce_0_flyover_color,
+            .extent = dM,
+            .input_queue = flyover_0_iq,
+        });
+        const fabout_reduce = @get_dsd(fabout_dsd, .{
+            .fabric_color = reduce_0_tx_color,
+            .extent = dM,
+            .output_queue = reduce_0_oq,
+        });
+        const fabout_flyover = @get_dsd(fabout_dsd, .{
+            .fabric_color = reduce_0_flyover_color,
+            .extent = dM,
+            .output_queue = flyover_0_oq,
+        });
+
+        if (my_x == isum_pe) {
+            if (my_x == kernel_x_dim - 1) {
+                @fmovs(fabout_flyover, accum_dsd, .{});
+            } else {
+                @fmovs(fabout_reduce, accum_dsd, .{});
+            }
+        } else if (my_x == fsum_pe) {
+            if (my_x == 0) {
+                @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{});
+            } else {
+                @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{});
+            }
+        } else {
+            if (my_x == 0) {
+                @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{});
+            } else if (my_x == kernel_x_dim - 1) {
+                @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{});
+            } else {
+                @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{});
+            }
+        }
+    } else {
+        const fabin_reduce = @get_dsd(fabin_dsd, .{
+            .fabric_color = reduce_1_rx_color,
+            .extent = dM,
+            .input_queue = reduce_1_iq,
+        });
+        const fabin_flyover = @get_dsd(fabin_dsd, .{
+            .fabric_color = reduce_1_flyover_color,
+            .extent = dM,
+            .input_queue = flyover_1_iq,
+        });
+        const fabout_reduce = @get_dsd(fabout_dsd, .{
+            .fabric_color = reduce_1_tx_color,
+            .extent = dM,
+            .output_queue = reduce_1_oq,
+        });
+        const fabout_flyover = @get_dsd(fabout_dsd, .{
+            .fabric_color = reduce_1_flyover_color,
+            .extent = dM,
+            .output_queue = flyover_1_oq,
+        });
+
+        if (my_x == isum_pe) {
+            if (my_x == kernel_x_dim - 1) {
+                @fmovs(fabout_flyover, accum_dsd, .{});
+            } else {
+                @fmovs(fabout_reduce, accum_dsd, .{});
+            }
+        } else if (my_x == fsum_pe) {
+            if (my_x == 0) {
+                @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{});
+            } else {
+                @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{});
+            }
+        } else {
+            if (my_x == 0) {
+                @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{});
+            } else if (my_x == kernel_x_dim - 1) {
+                @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{});
+            } else {
+                @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{});
+            }
         }
     }
 }
 
-// =============================================================================
-// Relay Task (PE(x,0) only)
-// =============================================================================
-var relay_buf: [1]f32 = @zeros([1]f32);
-task relay_task(in_data: f32) void {
-    relay_buf[0] = in_data;
-    const buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &relay_buf, .extent = 1 });
-    const out_dsd = @get_dsd(fabout_dsd, .{
-        .fabric_color = broadcast_rx_color,
-        .extent = 1,
-        .output_queue = broadcast_oq,
-    });
-    // Synchronous relay is safe here because it feeds directly into the fabric buffer
-    @fmovs(out_dsd, buf_dsd, .{});
+fn handle_bcast(stream: i16, val: f32) void {
+    const lane = stream % 2;
+
+    if (lane_stream[lane] != stream) {
+        lane_stream[lane] = stream;
+        lane_wcount[lane] = 0;
+        lane_colcount[lane] = 0;
+    }
+
+    var accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accums, .extent = dM });
+    accum_dsd = @increment_dsd_offset(accum_dsd, lane * dM, f32);
+
+    var a_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+    a_dsd = @increment_dsd_offset(a_dsd, lane_wcount[lane] * dM, f32);
+
+    @fmacs(accum_dsd, accum_dsd, a_dsd, val);
+
+    lane_wcount[lane] += 1;
+    if (lane_wcount[lane] != dH) { return; }
+
+    lane_wcount[lane] = 0;
+
+    const global_col = stream * dN_y + lane_colcount[lane];
+    reduce(lane, global_col);
+    @fmovs(accum_dsd, zeros_dsd, .{});
+
+    lane_colcount[lane] += 1;
+    reduce_count += 1;
+
+    if (lane_colcount[lane] == dN_y) {
+        source_done[stream] = 1;
+        maybe_activate_sender(stream);
+    }
+
+    if (reduce_count == @as(i16, kernel_y_dim) * dN_y) {
+        terminate_kernel();
+    }
 }
 
 // =============================================================================
-// Send B Data
+// Per-stream data tasks
+// =============================================================================
+task recv_bcast_0(val: f32) void { handle_bcast(0, val); }
+task recv_bcast_1(val: f32) void { handle_bcast(1, val); }
+task recv_bcast_2(val: f32) void { handle_bcast(2, val); }
+task recv_bcast_3(val: f32) void { handle_bcast(3, val); }
+task recv_bcast_4(val: f32) void { handle_bcast(4, val); }
+task recv_bcast_5(val: f32) void { handle_bcast(5, val); }
+task recv_bcast_6(val: f32) void { handle_bcast(6, val); }
+task recv_bcast_7(val: f32) void { handle_bcast(7, val); }
+
+// =============================================================================
+// Send B data
 // =============================================================================
 task send_b_task() void {
     has_sent = true;
@@ -148,26 +273,16 @@ task send_b_task() void {
 
 fn send_next_column() void {
     if (send_col >= dN_y) { return; }
-        const my_y = layout_mod.get_y_coord();
-        const offset = send_col * dH;
-        var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-        b_dsd = @increment_dsd_offset(b_dsd, offset, f32);
 
-        if (my_y == 0) {
-            const out_dsd = @get_dsd(fabout_dsd, .{
-            .fabric_color = broadcast_rx_color,
-            .extent = dH,
-            .output_queue = broadcast_oq,
-        });
-        @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
-        } else {
-            const out_dsd = @get_dsd(fabout_dsd, .{
-                .fabric_color = broadcast_tx_color,
-                .extent = dH,
-                .output_queue = broadcast_oq,
-        });
-        @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
-}
+    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
+    b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
+
+    const out_dsd = @get_dsd(fabout_dsd, .{
+        .fabric_color = my_bcast_color,
+        .extent = dH,
+        .output_queue = broadcast_oq,
+    });
+    @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
 }
 
 task send_done_task() void {
@@ -176,83 +291,16 @@ task send_done_task() void {
 }
 
 // =============================================================================
-// Rotating Ring Reduction (Synchronous)
-// =============================================================================
-fn reduce() void {
-    const my_x = @as(i16, layout_mod.get_x_coord());
-
-    // Determine roles for this column reduction
-    const fsum_pe = reduce_col / dN;
-    const isum_pe = (fsum_pe + 1) % kernel_x_dim;
-
-    var c_col_dsd = C_dsd;
-    c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
-
-    // Define ALL possible DSDs using strictly comptime-known queues and colors
-    const fabin_reduce = @get_dsd(fabin_dsd, .{
-        .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
-    });
-    const fabin_flyover = @get_dsd(fabin_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
-    });
-    const fabout_reduce = @get_dsd(fabout_dsd, .{
-        .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
-    });
-    const fabout_flyover = @get_dsd(fabout_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
-    });
-
-    // Execute State Machine using runtime branching
-    if (kernel_x_dim == 1) {
-    // Trivial case: single PE column
-    @fmovs(c_col_dsd, red_in_dsd, .{});
-        fsum_count += 1;
-    } else if (my_x == isum_pe) {
-    // ISUM: inject into the ring
-    if (my_x == kernel_x_dim - 1) {
-        @fmovs(fabout_flyover, red_in_dsd, .{});
-    } else {
-        @fmovs(fabout_reduce, red_in_dsd, .{});
-    }
-    } else if (my_x == fsum_pe) {
-    // FSUM: receive, add local, and store directly to C
-    if (my_x == 0) {
-        @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{});
-    } else {
-        @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{});
-    }
-    fsum_count += 1;
-    } else {
-    // PSUM: receive, add local, and forward
-    if (my_x == 0) {
-        // Receive from flyover (from kx-1), send to reduce (to pe 1)
-        @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{});
-    } else if (my_x == kernel_x_dim - 1) {
-        // Receive from reduce (from kx-2), send to flyover (to pe 0)
-        @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{});
-    } else {
-        // Receive from reduce, send to reduce
-        @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{});
-        }
-    }
-
-    // Clear accumulator for the next B column
-    @fmovs(red_in_dsd, zeros_dsd, .{});
-
-    reduce_col += 1;
-    if (reduce_col == @as(i16, kernel_y_dim) * dN_y) {
-        terminate_kernel();
-    }
-}
-
-// =============================================================================
 // Entry point
 // =============================================================================
 fn broadcast_pe() void {
     start_timer();
+    const my_y = @as(i16, layout_mod.get_y_coord());
 
-    const my_y = layout_mod.get_y_coord();
-    if (my_y == 0) {
+    lane_stream[0] = 0;
+    lane_stream[1] = 1;
+
+    if (my_y < STREAM_WINDOW) {
         @activate(send_task_id);
     }
 }
@@ -265,8 +313,14 @@ fn terminate_kernel() void {
 comptime {
     @comptime_assert(@is_arch("wse2"));
 
-    @bind_data_task(recv_broadcast_task, recv_task_id);
-    @bind_data_task(relay_task, relay_task_id);
+    @bind_data_task(recv_bcast_0, @get_data_task_id(bcast_color_0));
+    @bind_data_task(recv_bcast_1, @get_data_task_id(bcast_color_1));
+    if (kernel_y_dim > 2) { @bind_data_task(recv_bcast_2, @get_data_task_id(bcast_color_2)); }
+    if (kernel_y_dim > 3) { @bind_data_task(recv_bcast_3, @get_data_task_id(bcast_color_3)); }
+    if (kernel_y_dim > 4) { @bind_data_task(recv_bcast_4, @get_data_task_id(bcast_color_4)); }
+    if (kernel_y_dim > 5) { @bind_data_task(recv_bcast_5, @get_data_task_id(bcast_color_5)); }
+    if (kernel_y_dim > 6) { @bind_data_task(recv_bcast_6, @get_data_task_id(bcast_color_6)); }
+    if (kernel_y_dim > 7) { @bind_data_task(recv_bcast_7, @get_data_task_id(bcast_color_7)); }
 
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
