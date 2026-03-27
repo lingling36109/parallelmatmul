@@ -9,6 +9,7 @@
 //   6 reduce_B_color        15 bc7  24                   33
 //   7 reduce_C_color        16      25                   34
 //   8 bc0                   17      26                   35
+
 // Color IDs
 param MEMCPYH2D_DATA_1_ID: i16;
 param MEMCPYH2D_DATA_2_ID: i16;
@@ -24,7 +25,7 @@ param M: i16;
 param H: i16;
 param N: i16;
 
-// Define the 8 broadcast colors
+// Broadcast colors 8-15
 const c0: color = @get_color(8);
 const c1: color = @get_color(9);
 const c2: color = @get_color(10);
@@ -46,11 +47,11 @@ layout {
     for (@range(i16, kernel_x_dim)) |pe_x| {
         for (@range(i16, kernel_y_dim)) |pe_y| {
 
-            // Determine the color this specific PE uses to broadcast its row of B
+            // 1. Identify row-specific broadcast color
             const my_color = @get_color(8 + pe_y);
 
-            // Configure routing for the broadcast colors.
-            // We configure all 8 to be safe, using North-to-South flow.
+            // 2. Configure routing (NORTH -> SOUTH broadcast)
+            // We configure all possible broadcast colors for every PE to ensure connectivity
             @set_color_config(pe_x, pe_y, c0, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
             @set_color_config(pe_x, pe_y, c1, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
             @set_color_config(pe_x, pe_y, c2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
@@ -60,7 +61,7 @@ layout {
             @set_color_config(pe_x, pe_y, c6, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
             @set_color_config(pe_x, pe_y, c7, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP, SOUTH} } });
 
-            // Assign code to EVERY PE in the loop
+            // 3. Assign code IMMEDIATELY after color config
             @set_tile_code(pe_x, pe_y, "pe.csl", .{
                 .memcpy_params = memcpy.get_params(pe_x),
                 .dM = M / kernel_y_dim,
