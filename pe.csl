@@ -1,79 +1,71 @@
-// pe.csl
 param bcast_up_color: color;
-param next_pe_color: color;
+param sentinel_color: color;
 param bcast_down_colors: [8]color;
 param pe_y: i16;
-// ... (other existing params)
+// ... (include all other params from your original pe.csl)
 
-// Task IDs
-const send_b_task_id: data_task_id = @get_data_task_id(bcast_up_color);
-const token_task_id:  data_task_id = @get_data_task_id(next_pe_color);
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
 var b_buf = @zeros([dN * dH]f32);
-var current_bcast_sender: i16 = 0;
+var current_row_processing: i16 = 0;
 
-// DSDs for sending B
-// If row 0, send directly to down-color. Others send to UP-color.
-const b_out_dsd = @get_dsd(fabbric_dsd, .{
+// DSD for my local B data broadcast
+const my_bcast_dsd = @get_dsd(fabbric_dsd, .{
     .extent = dN * dH,
     .fabric_color = (pe_y == 0) ? bcast_down_colors[0] : bcast_up_color,
     .output_queue = @get_output_queue(1)
 });
 
-// Row 0 Repeater: Receives from UP, sends to the specific DOWN color
-// This task only runs on PE(x, 0)
-task row0_repeater(data: f32) void {
-    const down_dsd = @get_dsd(fabbric_dsd, .{
+// TASK: PE 0 Repeater (Only active on Row 0)
+// Forwards data from UP color to the specific DOWN color for the current sender
+task repeater_task(data: f32) void {
+    const down_color = bcast_down_colors[current_row_processing];
+    const out_dsd = @get_dsd(fabbric_dsd, .{
         .extent = dN * dH,
-        .fabric_color = bcast_down_colors[current_bcast_sender],
+        .fabric_color = down_color,
         .output_queue = @get_output_queue(2)
     });
-    // Use asynchronous move to forward the whole stream
-    @fmovs(down_dsd, @get_dsd(fabbric_dsd, .{ .extent = dN * dH, .fabric_color = bcast_up_color }));
+    // This blocks until the whole stream is moved
+    @fmovs(out_dsd, @get_dsd(fabbric_dsd, .{ .extent = dN * dH, .fabric_color = bcast_up_color }));
 }
 
-// When a broadcast from sender 'i' finishes, move to sender 'i+1'
-fn finish_bcast_segment() void {
-    current_bcast_sender += 1;
-    if (current_bcast_sender < kernel_y_dim) {
-        // Trigger reduction for the finished B-segment
-        reduce();
-    } else {
-        // All segments done
-        terminate_kernel();
-    }
-}
+// TASK: Start my broadcast (When it's my turn)
+task send_my_b_task() void {
+    @fmovs(my_bcast_dsd, @get_dsd(mem1d_dsd, .{ .tensor_access = |i| b_buf[i], .extent = dN * dH }));
 
-// Sequencer: Start my broadcast
-task start_my_send() void {
-    @fmovs(b_out_dsd, @get_dsd(mem1d_dsd, .{ .tensor_access = |i| b_buf[i], .extent = dN * dH }));
-
-    // Signal the next PE to start
+    // Pass the turn to the PE below me
     if (pe_y < kernel_y_dim - 1) {
-        const next_dsd = @get_dsd(fabbric_dsd, .{ .extent = 1, .fabric_color = next_pe_color });
-        @mov32(next_dsd, 1.0f32);
+        const sen_dsd = @get_dsd(fabbric_dsd, .{ .extent = 1, .fabric_color = sentinel_color });
+        @mov32(sen_dsd, 1.0f32);
     }
 }
 
-// Entry Point
+// Handle data from any row broadcast
+fn process_incoming_b(sender_id: i16) void {
+    // 1. Multiply with local A
+    // 2. Call reduce()
+    // 3. current_row_processing++
+    // 4. If current == kernel_y_dim, terminate_kernel()
+}
+
+// Entry point
 fn broadcast_pe() void {
     if (pe_y == 0) {
-        @activate(start_my_send);
+        @activate(send_my_b_task);
     }
 }
 
 comptime {
-    // Row 0 listens for data coming UP to repeat it DOWN
     if (pe_y == 0) {
-        @bind_data_task(row0_repeater, @get_data_task_id(bcast_up_color));
+        @bind_data_task(repeater_task, @get_data_task_id(bcast_up_color));
     }
 
-    // Everyone listens for the token to start their send
-    @bind_data_task(start_my_send, token_task_id);
+    // Bind the sentinel task to start my send
+    @bind_data_task(send_my_b_task, @get_data_task_id(sentinel_color));
 
-    // Bind all 8 broadcast receive tasks to handle the data in order
-    // Ensure handle_bcast calls finish_bcast_segment() upon completion
-    @bind_data_task(handle_bcast0, @get_data_task_id(bcast_down_colors[0]));
-    @bind_data_task(handle_bcast1, @get_data_task_id(bcast_down_colors[1]));
+    // Bind each broadcast color to a handler that maintains order
+    // (Ensure these handlers call process_incoming_b with the right index)
+    @bind_data_task(recv_0, @get_data_task_id(bcast_down_colors[0]));
+    @bind_data_task(recv_1, @get_data_task_id(bcast_down_colors[1]));
     // ... repeat for 0-7 ...
 }

@@ -1,4 +1,3 @@
-// layout.csl
 param MEMCPYH2D_DATA_1_ID: i16;
 param MEMCPYH2D_DATA_2_ID: i16;
 param MEMCPYD2H_DATA_1_ID: i16;
@@ -10,11 +9,9 @@ const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
 
-// Shared colors for coordination
 const bcast_up_color:  color = @get_color(16);
-const next_pe_color:   color = @get_color(17);
+const sentinel_color:  color = @get_color(17);
 
-// Row-specific broadcast colors (Downwards)
 const bc_colors = [8]color{
   @get_color(8),  @get_color(9),  @get_color(10), @get_color(11),
   @get_color(12), @get_color(13), @get_color(14), @get_color(15)
@@ -27,20 +24,18 @@ const reduce_C_color: color = @get_color(7);
 layout {
   @set_struct_id(0);
 
-  for (let pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x++) {
-    for (let pe_y: i16 = 0; pe_y < kernel_y_dim; pe_y++) {
+  for (var pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x++) {
+    for (var pe_y: i16 = 0; pe_y < kernel_y_dim; pe_y++) {
 
-      const bcast_down_color = bc_colors[pe_y];
-
-      // --- Broadcast UP Path (to Row 0) ---
+      // --- UPWARD Route: SOUTH -> NORTH ---
       if (pe_y == 0) {
         @set_color_config(pe_x, pe_y, bcast_up_color, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
       } else {
         @set_color_config(pe_x, pe_y, bcast_up_color, .{ .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{NORTH} } });
       }
 
-      // --- Broadcast DOWN Path (from Row 0 to all) ---
-      for (let i: i16 = 0; i < kernel_y_dim; i++) {
+      // --- DOWNWARD Routes: NORTH -> SOUTH ---
+      for (var i: i16 = 0; i < 8; i++) {
         const c = bc_colors[i];
         if (pe_y == 0) {
           @set_color_config(pe_x, pe_y, c, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
@@ -51,26 +46,45 @@ layout {
         }
       }
 
-      // --- Token Passing (Sequencing) ---
+      // --- SENTINEL (Turn Passing) ---
       if (pe_y < kernel_y_dim - 1) {
-        @set_color_config(pe_x, pe_y, next_pe_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+        @set_color_config(pe_x, pe_y, sentinel_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
       }
       if (pe_y > 0) {
-        @set_color_config(pe_x, pe_y, next_pe_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+        @set_color_config(pe_x, pe_y, sentinel_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
       }
 
-      // --- Reduction Routing (Simplified Row Reduction) ---
-      // (Keep your existing reduction logic here, ensuring EAST/WEST routes)
-      // ... [Standard Reduction Routing] ...
+      // --- REDUCTION (EAST/WEST) ---
+      // (Assumes PE 0 is root for simplicity; match your A/B swap logic here)
+      if (pe_x == 0) {
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+      } else if (pe_x == kernel_x_dim - 1) {
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST} } });
+      }
+      // Scatter result WEST
+      if (pe_x == kernel_x_dim - 1) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+      } else if (pe_x == 0) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } });
+      }
 
       @set_tile_code(pe_x, pe_y, "pe.csl", .{
         .memcpy_params = sys_mod.get_params(pe_x),
         .kernel_x_dim = kernel_x_dim, .kernel_y_dim = kernel_y_dim,
         .pe_x = pe_x, .pe_y = pe_y,
         .bcast_up_color = bcast_up_color,
-        .next_pe_color = next_pe_color,
+        .sentinel_color = sentinel_color,
         .bcast_down_colors = bc_colors,
-        // ... other params ...
+        .reduce_A_color = reduce_A_color,
+        .reduce_B_color = reduce_B_color,
+        .reduce_C_color = reduce_C_color
       });
     }
   }
