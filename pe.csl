@@ -100,9 +100,8 @@ var stream_cols_ready: [8]i16 = @zeros([8]i16);
 
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(16);
-const send_done_task_id: local_task_id = @get_local_task_id(17);
+const reduce_done_task_id: local_task_id = @get_local_task_id(17);
 const gemv_task_id: local_task_id = @get_local_task_id(18);
-const reduce_done_task_id: local_task_id = @get_local_task_id(19);
 
 // =============================================================================
 // Broadcast receive: buffer wavelets, trigger GEMV when column complete
@@ -242,15 +241,10 @@ task reduce_done_task() void {
 }
 
 // =============================================================================
-// Send B Data (each PE sends on its own unique color) — unchanged
+// Send B Data — synchronous send with self-reactivation to yield to data tasks
 // =============================================================================
 task send_b_task() void {
-    send_col = 0;
-    send_next_column();
-}
-
-fn send_next_column() void {
-    if (send_col >= dN_y) { return; }
+    if (send_col >= dN_y) return;
 
     var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
     b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
@@ -260,12 +254,12 @@ fn send_next_column() void {
         .extent = dH,
         .output_queue = broadcast_oq,
     });
-    @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
-}
+    @fmovs(out_dsd, b_dsd, .{});  // SYNC: no microthread used
 
-task send_done_task() void {
     send_col += 1;
-    send_next_column();
+    if (send_col < dN_y) {
+        @activate(send_task_id);  // re-queue self; pending data tasks run first
+    }
 }
 
 // =============================================================================
@@ -296,7 +290,6 @@ comptime {
 
     // Bind local tasks
     @bind_local_task(send_b_task, send_task_id);
-    @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(gemv_task, gemv_task_id);
     @bind_local_task(reduce_done_task, reduce_done_task_id);
 
