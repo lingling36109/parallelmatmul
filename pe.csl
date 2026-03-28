@@ -94,6 +94,7 @@ var proc_source: i16 = 0;
 var proc_col: i16 = 0;
 var total_reduces_done: i16 = 0;
 var gemv_active: bool = false;
+var reduce_in_flight: bool = false;
 
 // Track how many complete columns each stream has buffered
 var stream_cols_ready: [8]i16 = @zeros([8]i16);
@@ -157,6 +158,7 @@ task gemv_task() void {
     }
 
     // Launch async ring reduction
+    reduce_in_flight = true;
     const global_col = s * dN_y + proc_col;
     reduce_async(global_col);
 }
@@ -216,6 +218,8 @@ fn reduce_async(global_col: i16) void {
 // Reduce done: clear accum, advance state, chain to next GEMV
 // =============================================================================
 task reduce_done_task() void {
+    reduce_in_flight = false;
+
     // Clear accumulator
     @fmovs(accum_dsd, zeros_dsd, .{});
 
@@ -235,6 +239,11 @@ task reduce_done_task() void {
         return;
     }
 
+    // Resume sending if it was deferred by reduce_in_flight guard
+    if (send_col < dN_y) {
+        @activate(send_task_id);
+    }
+
     // Try to start next GEMV
     gemv_active = false;
     try_start_gemv();
@@ -245,6 +254,7 @@ task reduce_done_task() void {
 // =============================================================================
 task send_b_task() void {
     if (send_col >= dN_y) return;
+    if (reduce_in_flight) return;  // defer: reduce_done_task will re-activate us
 
     var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
     b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
@@ -254,7 +264,7 @@ task send_b_task() void {
         .extent = dH,
         .output_queue = broadcast_oq,
     });
-    @fmovs(out_dsd, b_dsd, .{});  // SYNC: no microthread used
+    @fmovs(out_dsd, b_dsd, .{});  // SYNC: uses microthread briefly, CE waits
 
     send_col += 1;
     if (send_col < dN_y) {
