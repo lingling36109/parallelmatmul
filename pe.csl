@@ -53,11 +53,13 @@ fn end_timer() void {
 // =============================================================================
 const broadcast_oq: output_queue = @get_output_queue(2);
 const reduce_oq: output_queue = @get_output_queue(3);
-const reduce_iq: input_queue = @get_input_queue(2);
+// IQ 0 reused for ring reduce receive after broadcast phase completes (sends_done gate ensures safety)
+const reduce_iq: input_queue = @get_input_queue(0);
 
 const flyover_color: color = scatter_color;
 const flyover_oq: output_queue = @get_output_queue(4);
-const flyover_iq: input_queue = @get_input_queue(4);
+// IQ 1 reused for flyover receive after broadcast phase completes
+const flyover_iq: input_queue = @get_input_queue(1);
 
 // =============================================================================
 // Storage
@@ -73,8 +75,8 @@ var ptr_C: [*]f32 = &C;
 // Per-stream B column buffer: stores ALL received columns before GEMV
 // Layout: b_bufs[stream * dN_y * dH + col * dH + pos]
 var b_bufs: [8 * dN_y * dH]f32 = @zeros([8 * dN_y * dH]f32);
-var b_buf_wpos: [8]i16 = @zeros([8]i16);  // wavelet pos within current column (0..dH-1)
-var b_buf_col: [8]i16 = @zeros([8]i16);   // which column being written (0..dN_y-1)
+// b_buf_wpos removed: bulk fabin DMA receives entire column atomically, no per-element position tracking
+var b_buf_col: [8]i16 = @zeros([8]i16);   // which column to receive next (0..dN_y-1)
 
 // Single accumulator for GEMV output
 var accum: [dM]f32 = @zeros([dM]f32);
@@ -106,24 +108,62 @@ const gemv_task_id: local_task_id = @get_local_task_id(18);
 const send_done_task_id: local_task_id = @get_local_task_id(19);
 
 // =============================================================================
-// Broadcast receive: buffer wavelets, trigger GEMV when column complete
+// Bulk fabin receive: DMA entire B column directly into b_bufs, no per-wavelet tasks
 // =============================================================================
-fn handle_bcast(stream: i16, val: f32) void {
-    const col = b_buf_col[stream];
-    const pos = b_buf_wpos[stream];
-    b_bufs[@as(u16, stream * dN_y * dH + col * dH + pos)] = val;
-    b_buf_wpos[stream] = pos + 1;
 
-    if (pos + 1 == dH) {
-        // Full B column received for this stream
-        b_buf_wpos[stream] = 0;
-        b_buf_col[stream] = col + 1;
-        stream_cols_ready[stream] += 1;
-        // Only start GEMV pipeline after all sends are done (avoids microthread conflict)
-        if (sends_done) {
-            try_start_gemv();
-        }
+// recv_done task IDs (20-27), declared here so arm_recv can reference them
+const recv_done_0_id: local_task_id = @get_local_task_id(20);
+const recv_done_1_id: local_task_id = @get_local_task_id(21);
+const recv_done_2_id: local_task_id = @get_local_task_id(22);
+const recv_done_3_id: local_task_id = @get_local_task_id(23);
+const recv_done_4_id: local_task_id = @get_local_task_id(24);
+const recv_done_5_id: local_task_id = @get_local_task_id(25);
+const recv_done_6_id: local_task_id = @get_local_task_id(26);
+const recv_done_7_id: local_task_id = @get_local_task_id(27);
+
+// arm_recv: issue async bulk DMA receive for stream s, current column.
+// Each branch uses comptime-constant color and IQ (required by @get_dsd / @get_input_queue).
+// IQ = stream index (0..7); fabric delivers dH elements directly into b_bufs.
+// IQ 0 and IQ 1 are reused for ring-reduce/flyover after broadcast phase completes.
+fn arm_recv(stream: i16) void {
+    const col = b_buf_col[stream];
+    if (col >= dN_y) return;
+
+    var buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &b_bufs, .extent = dH });
+    buf_dsd = @increment_dsd_offset(buf_dsd, stream * dN_y * dH + col * dH, f32);
+
+    if (stream == 0) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_0, .extent = dH, .input_queue = @get_input_queue(0) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_0_id });
+    } else if (stream == 1) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_1, .extent = dH, .input_queue = @get_input_queue(1) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_1_id });
+    } else if (stream == 2) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_2, .extent = dH, .input_queue = @get_input_queue(2) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_2_id });
+    } else if (stream == 3) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_3, .extent = dH, .input_queue = @get_input_queue(3) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_3_id });
+    } else if (stream == 4) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_4, .extent = dH, .input_queue = @get_input_queue(4) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_4_id });
+    } else if (stream == 5) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_5, .extent = dH, .input_queue = @get_input_queue(5) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_5_id });
+    } else if (stream == 6) {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_6, .extent = dH, .input_queue = @get_input_queue(6) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_6_id });
+    } else {
+        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_7, .extent = dH, .input_queue = @get_input_queue(7) });
+        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_7_id });
     }
+}
+
+fn handle_recv_done(stream: i16) void {
+    stream_cols_ready[stream] += 1;
+    b_buf_col[stream] += 1;
+    arm_recv(stream);  // pre-arm next column DMA
+    if (sends_done) { try_start_gemv(); }
 }
 
 fn try_start_gemv() void {
@@ -135,30 +175,32 @@ fn try_start_gemv() void {
     }
 }
 
-// =============================================================================
-// Per-stream data tasks (thin: just buffer the wavelet)
-// =============================================================================
-task recv_bcast_0(val: f32) void { handle_bcast(0, val); }
-task recv_bcast_1(val: f32) void { handle_bcast(1, val); }
-task recv_bcast_2(val: f32) void { handle_bcast(2, val); }
-task recv_bcast_3(val: f32) void { handle_bcast(3, val); }
-task recv_bcast_4(val: f32) void { handle_bcast(4, val); }
-task recv_bcast_5(val: f32) void { handle_bcast(5, val); }
-task recv_bcast_6(val: f32) void { handle_bcast(6, val); }
-task recv_bcast_7(val: f32) void { handle_bcast(7, val); }
+// One completion task per broadcast source (fires when full column DMA'd into b_bufs)
+task recv_done_0() void { handle_recv_done(0); }
+task recv_done_1() void { handle_recv_done(1); }
+task recv_done_2() void { handle_recv_done(2); }
+task recv_done_3() void { handle_recv_done(3); }
+task recv_done_4() void { handle_recv_done(4); }
+task recv_done_5() void { handle_recv_done(5); }
+task recv_done_6() void { handle_recv_done(6); }
+task recv_done_7() void { handle_recv_done(7); }
 
 // =============================================================================
 // GEMV task: process one buffered B column
 // =============================================================================
 task gemv_task() void {
     const s = proc_source;
+    const b_base: u16 = @as(u16, s * dN_y * dH + proc_col * dH);
 
     // GEMV: accum += A * b_bufs[s, proc_col, :]
+    // Precompute base A-column DSD once; increment by dM each iteration
+    var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
     var h: i16 = 0;
     while (h < dH) : (h += 1) {
-        var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-        a_col_dsd = @increment_dsd_offset(a_col_dsd, h * dM, f32);
-        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[@as(u16, s * dN_y * dH + proc_col * dH + h)]);
+        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[b_base + @as(u16, h)]);
+        if (h + 1 < dH) {
+            a_col_dsd = @increment_dsd_offset(a_col_dsd, dM, f32);
+        }
     }
 
     // Launch async ring reduction
@@ -277,7 +319,19 @@ task send_done_task() void {
 // =============================================================================
 fn broadcast_pe() void {
     start_timer();
-    @activate(send_task_id);
+
+    // Pre-arm bulk fabin DMA for each broadcast source (column 0 of each stream).
+    // Must be issued before sends start so IQ hardware captures arriving wavelets.
+    arm_recv(0);
+    arm_recv(1);
+    if (kernel_y_dim > 2) { arm_recv(2); }
+    if (kernel_y_dim > 3) { arm_recv(3); }
+    if (kernel_y_dim > 4) { arm_recv(4); }
+    if (kernel_y_dim > 5) { arm_recv(5); }
+    if (kernel_y_dim > 6) { arm_recv(6); }
+    if (kernel_y_dim > 7) { arm_recv(7); }
+
+    @activate(send_task_id);  // start async send chain
 }
 
 fn terminate_kernel() void {
@@ -288,21 +342,23 @@ fn terminate_kernel() void {
 comptime {
     @comptime_assert(@is_arch("wse2"));
 
-    // Bind per-stream broadcast receive tasks (thin buffering)
-    @bind_data_task(recv_bcast_0, @get_data_task_id(bcast_color_0));
-    @bind_data_task(recv_bcast_1, @get_data_task_id(bcast_color_1));
-    if (kernel_y_dim > 2) { @bind_data_task(recv_bcast_2, @get_data_task_id(bcast_color_2)); }
-    if (kernel_y_dim > 3) { @bind_data_task(recv_bcast_3, @get_data_task_id(bcast_color_3)); }
-    if (kernel_y_dim > 4) { @bind_data_task(recv_bcast_4, @get_data_task_id(bcast_color_4)); }
-    if (kernel_y_dim > 5) { @bind_data_task(recv_bcast_5, @get_data_task_id(bcast_color_5)); }
-    if (kernel_y_dim > 6) { @bind_data_task(recv_bcast_6, @get_data_task_id(bcast_color_6)); }
-    if (kernel_y_dim > 7) { @bind_data_task(recv_bcast_7, @get_data_task_id(bcast_color_7)); }
+    // No @bind_data_task: broadcast colors now consumed via bulk fabin_dsd in arm_recv()
 
     // Bind local tasks
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(gemv_task, gemv_task_id);
     @bind_local_task(reduce_done_task, reduce_done_task_id);
+
+    // Bind bulk recv completion tasks (one per source stream)
+    @bind_local_task(recv_done_0, recv_done_0_id);
+    @bind_local_task(recv_done_1, recv_done_1_id);
+    if (kernel_y_dim > 2) { @bind_local_task(recv_done_2, recv_done_2_id); }
+    if (kernel_y_dim > 3) { @bind_local_task(recv_done_3, recv_done_3_id); }
+    if (kernel_y_dim > 4) { @bind_local_task(recv_done_4, recv_done_4_id); }
+    if (kernel_y_dim > 5) { @bind_local_task(recv_done_5, recv_done_5_id); }
+    if (kernel_y_dim > 6) { @bind_local_task(recv_done_6, recv_done_6_id); }
+    if (kernel_y_dim > 7) { @bind_local_task(recv_done_7, recv_done_7_id); }
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
