@@ -111,15 +111,15 @@ const send_done_task_id: local_task_id = @get_local_task_id(19);
 // Bulk fabin receive: DMA entire B column directly into b_bufs, no per-wavelet tasks
 // =============================================================================
 
-// recv_done task IDs (20-27), declared here so arm_recv can reference them
+// recv_done task IDs — skip 21 (memcpyd2h LOCAL_MEMCPYD2H_DATA) and 27 (memcpy SYS_UBLK_C22)
 const recv_done_0_id: local_task_id = @get_local_task_id(20);
-const recv_done_1_id: local_task_id = @get_local_task_id(21);
-const recv_done_2_id: local_task_id = @get_local_task_id(22);
-const recv_done_3_id: local_task_id = @get_local_task_id(23);
-const recv_done_4_id: local_task_id = @get_local_task_id(24);
-const recv_done_5_id: local_task_id = @get_local_task_id(25);
-const recv_done_6_id: local_task_id = @get_local_task_id(26);
-const recv_done_7_id: local_task_id = @get_local_task_id(27);
+const recv_done_1_id: local_task_id = @get_local_task_id(22);  // skip 21
+const recv_done_2_id: local_task_id = @get_local_task_id(23);
+const recv_done_3_id: local_task_id = @get_local_task_id(24);
+const recv_done_4_id: local_task_id = @get_local_task_id(25);
+const recv_done_5_id: local_task_id = @get_local_task_id(26);
+const recv_done_6_id: local_task_id = @get_local_task_id(28);  // skip 27
+const recv_done_7_id: local_task_id = @get_local_task_id(29);
 
 // arm_recv: issue async bulk DMA receive for stream s, current column.
 // Each branch uses comptime-constant color and IQ (required by @get_dsd / @get_input_queue).
