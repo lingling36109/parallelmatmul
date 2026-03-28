@@ -62,7 +62,7 @@ layout {
   @comptime_assert(kernel_y_dim >= 2);
 
   // The tensor mapping is fixed for this homework, so we can precompute the parameters for each PE
-  //  and pass them in via the tile code. This struct will be concatenated with the memcpy parameters.
+  //  and pass them in via the tile code. This struct will be concatenated with the memcpy parameters. 
   // e.g.:
   //     @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
   //       common_params,
@@ -90,7 +90,7 @@ layout {
   //  1) Configure broadcast routes using @set_color_config.
   //     Broadcasting sends B-column data from each PE in turn down the
   //     Y-column. Use color swap or an additional PE to change the color.
-  //     Hint: if you need to send SWITCH_ADV signals on the same color,
+  //     Hint: if you need to send SWITCH_ADV signals on the same color, 
   //     also RAMP needs swap_x and swap_y to be enabled.
   //
   //  2) Upon receiving a broadcast wavelet, a PE should trigger a SAXPY operation
@@ -162,7 +162,7 @@ layout {
         });
       } else {
         @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
-          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} },
+          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} }, 
         });
         @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
           .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
