@@ -94,7 +94,7 @@ var proc_source: i16 = 0;
 var proc_col: i16 = 0;
 var total_reduces_done: i16 = 0;
 var gemv_active: bool = false;
-var reduce_in_flight: bool = false;
+var sends_done: bool = false;
 
 // Track how many complete columns each stream has buffered
 var stream_cols_ready: [8]i16 = @zeros([8]i16);
@@ -118,7 +118,10 @@ fn handle_bcast(stream: i16, val: f32) void {
         b_buf_wpos[stream] = 0;
         b_buf_col[stream] = col + 1;
         stream_cols_ready[stream] += 1;
-        try_start_gemv();
+        // Only start GEMV pipeline after all sends are done (avoids microthread conflict)
+        if (sends_done) {
+            try_start_gemv();
+        }
     }
 }
 
@@ -158,7 +161,6 @@ task gemv_task() void {
     }
 
     // Launch async ring reduction
-    reduce_in_flight = true;
     const global_col = s * dN_y + proc_col;
     reduce_async(global_col);
 }
@@ -218,8 +220,6 @@ fn reduce_async(global_col: i16) void {
 // Reduce done: clear accum, advance state, chain to next GEMV
 // =============================================================================
 task reduce_done_task() void {
-    reduce_in_flight = false;
-
     // Clear accumulator
     @fmovs(accum_dsd, zeros_dsd, .{});
 
@@ -239,11 +239,6 @@ task reduce_done_task() void {
         return;
     }
 
-    // Resume sending if it was deferred by reduce_in_flight guard
-    if (send_col < dN_y) {
-        @activate(send_task_id);
-    }
-
     // Try to start next GEMV
     gemv_active = false;
     try_start_gemv();
@@ -253,8 +248,12 @@ task reduce_done_task() void {
 // Send B Data — synchronous send with self-reactivation to yield to data tasks
 // =============================================================================
 task send_b_task() void {
-    if (send_col >= dN_y) return;
-    if (reduce_in_flight) return;  // defer: reduce_done_task will re-activate us
+    if (send_col >= dN_y) {
+        // All sends complete — start GEMV pipeline (no more fabric sends = no microthread conflict)
+        sends_done = true;
+        try_start_gemv();
+        return;
+    }
 
     var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
     b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
@@ -264,12 +263,10 @@ task send_b_task() void {
         .extent = dH,
         .output_queue = broadcast_oq,
     });
-    @fmovs(out_dsd, b_dsd, .{});  // SYNC: uses microthread briefly, CE waits
+    @fmovs(out_dsd, b_dsd, .{});  // SYNC: CE waits ~dH cycles
 
     send_col += 1;
-    if (send_col < dN_y) {
-        @activate(send_task_id);  // re-queue self; pending data tasks run first
-    }
+    @activate(send_task_id);  // re-queue self; pending data tasks run first
 }
 
 // =============================================================================
