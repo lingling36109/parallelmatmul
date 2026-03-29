@@ -17,7 +17,7 @@ const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
 // Comptime PE coordinate (used for head-PE vs non-head branching)
-const my_y = @as(i16, layout_mod.get_y_coord());
+// const my_y = @as(i16, layout_mod.get_y_coord());
 
 // =============================================================================
 // TSC timer buffers

@@ -76,28 +76,32 @@ layout {
   for (@range(i16, kernel_x_dim)) |pe_x| {
     for (@range(i16, kernel_y_dim)) |pe_y| {
 
-      // --- Set tile code with checkerboard reduce colors ---
-      if (pe_x % 2 == 0) {
-        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-          common_params,
-          .{
-            .memcpy_params = memcpy.get_params(pe_x),
-            .reduce_tx_color = reduce_A_color,
-            .reduce_rx_color = reduce_B_color,
-            .scatter_color = reduce_C_color,
-          },
-        ));
-      } else {
-        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-          common_params,
-          .{
-            .memcpy_params = memcpy.get_params(pe_x),
-            .reduce_tx_color = reduce_B_color,
-            .reduce_rx_color = reduce_A_color,
-            .scatter_color = reduce_C_color,
-          },
-        ));
-      }
+// --- Set tile code with checkerboard reduce colors ---
+if (pe_x % 2 == 0) {
+  @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+    common_params,
+    .{
+      .memcpy_params = memcpy.get_params(pe_x),
+      .my_x = @as(i16, pe_x), // Pass X coordinate
+      .my_y = @as(i16, pe_y), // Pass Y coordinate
+      .reduce_tx_color = reduce_A_color,
+      .reduce_rx_color = reduce_B_color,
+      .scatter_color = reduce_C_color,
+    },
+  ));
+} else {
+  @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+    common_params,
+    .{
+      .memcpy_params = memcpy.get_params(pe_x),
+      .my_x = @as(i16, pe_x), // Pass X coordinate
+      .my_y = @as(i16, pe_y), // Pass Y coordinate
+      .reduce_tx_color = reduce_B_color,
+      .reduce_rx_color = reduce_A_color,
+      .scatter_color = reduce_C_color,
+    },
+  ));
+}
 
       // =================================================================
       // Broadcast TX routing (bcast_tx_color): PEs send B-segments NORTH
