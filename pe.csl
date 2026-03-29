@@ -6,24 +6,18 @@ param dN_y: i16;
 param dH: i16;
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
-param my_bcast_color: color;
+param bcast_tx_color: color;
+param bcast_rx_color: color;
 param reduce_tx_color: color;
 param reduce_rx_color: color;
 param scatter_color: color;
 
-// Broadcast receive colors (one per PE row, up to 8)
-param bcast_color_0: color;
-param bcast_color_1: color;
-param bcast_color_2: color;
-param bcast_color_3: color;
-param bcast_color_4: color;
-param bcast_color_5: color;
-param bcast_color_6: color;
-param bcast_color_7: color;
-
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
+
+// Comptime PE coordinate (used for head-PE vs non-head branching)
+const my_y = @as(i16, layout_mod.get_y_coord());
 
 // =============================================================================
 // TSC timer buffers
@@ -51,15 +45,17 @@ fn end_timer() void {
 // =============================================================================
 // Queue declarations
 // =============================================================================
-const broadcast_oq: output_queue = @get_output_queue(2);
+// Broadcast: source PE sends on TX, all PEs receive on RX
+const bcast_tx_oq: output_queue = @get_output_queue(2);
+const bcast_rx_iq: input_queue = @get_input_queue(1);
+
+// Reduction (unchanged)
 const reduce_oq: output_queue = @get_output_queue(3);
-// IQ 0 reused for ring reduce receive after broadcast phase completes (sends_done gate ensures safety)
-const reduce_iq: input_queue = @get_input_queue(0);
+const reduce_iq: input_queue = @get_input_queue(2);
 
 const flyover_color: color = scatter_color;
 const flyover_oq: output_queue = @get_output_queue(4);
-// IQ 1 reused for flyover receive after broadcast phase completes
-const flyover_iq: input_queue = @get_input_queue(1);
+const flyover_iq: input_queue = @get_input_queue(4);
 
 // =============================================================================
 // Storage
@@ -72,13 +68,11 @@ var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-// Per-stream B column buffer: stores ALL received columns before GEMV
-// Layout: b_bufs[stream * dN_y * dH + col * dH + pos]
-var b_bufs: [8 * dN_y * dH]f32 = @zeros([8 * dN_y * dH]f32);
-// b_buf_wpos removed: bulk fabin DMA receives entire column atomically, no per-element position tracking
-var b_buf_col: [8]i16 = @zeros([8]i16);   // which column to receive next (0..dN_y-1)
+// Single B column buffer: receives one dH-vector per broadcast round
+var b_vec: [dH]f32 = @zeros([dH]f32);
+const b_vec_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &b_vec, .extent = dH });
 
-// Single accumulator for GEMV output
+// Accumulator for GEMV output
 var accum: [dM]f32 = @zeros([dM]f32);
 const accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
 
@@ -87,129 +81,116 @@ const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
 // =============================================================================
-// Global state
+// Fabric DSDs (comptime constants)
 // =============================================================================
-var send_col: i16 = 0;
+// All PEs receive broadcast data on bcast_rx_color
+const fabin_rx_dsd = @get_dsd(fabin_dsd, .{
+    .fabric_color = bcast_rx_color,
+    .extent = dH,
+    .input_queue = bcast_rx_iq,
+});
 
-// Round-robin processing: for each col j, process all sources s=0..kernel_y_dim-1
-var proc_source: i16 = 0;
-var proc_col: i16 = 0;
+// Source PEs send B columns on bcast_tx_color (synchronous)
+const fabout_tx_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = bcast_tx_color,
+    .extent = dH,
+    .output_queue = bcast_tx_oq,
+});
+
+// Control DSD for SWITCH_ADV on bcast_tx_color (synchronous, 1 wavelet)
+const ctrl_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = bcast_tx_color,
+    .extent = 1,
+    .control = true,
+    .output_queue = bcast_tx_oq,
+});
+
+// =============================================================================
+// SWITCH_ADV control wavelet
+// =============================================================================
+// The head PE's bcast_tx_color switch has 2 positions:
+//   pos1: rx=RAMP (head PE is source)
+//   pos2: rx=SOUTH (other PE is source)
+// SWITCH_ADV toggles between them. We send it:
+//   - After source 0 sends (pos1 → pos2, ready for source 1+)
+//   - After last source sends (pos2 → pos1, ready for next column's source 0)
+// The control wavelet payload encodes SWITCH_ADV opcode.
+var switch_adv_buf: [1]u32 = .{1}; // SWITCH_ADV payload (adjust encoding if needed)
+const switch_adv_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &switch_adv_buf, .extent = 1 });
+
+fn send_switch_adv() void {
+    // Synchronous control wavelet: advances head PE's TX switch position
+    @fmovs(ctrl_dsd, switch_adv_dsd);
+}
+
+// =============================================================================
+// Global state — sequential broadcast state machine
+// =============================================================================
+// Round-robin: for each column, cycle all sources
+var proc_source: i16 = 0;  // current source PE row (0..kernel_y_dim-1)
+var proc_col: i16 = 0;     // current B column index (0..dN_y-1)
 var total_reduces_done: i16 = 0;
-var gemv_active: bool = false;
-var sends_done: bool = false;
 
-// Track how many complete columns each stream has buffered
-var stream_cols_ready: [8]i16 = @zeros([8]i16);
-
-// Task IDs
-const send_task_id: local_task_id = @get_local_task_id(16);
-const reduce_done_task_id: local_task_id = @get_local_task_id(17);
-const gemv_task_id: local_task_id = @get_local_task_id(18);
-const send_done_task_id: local_task_id = @get_local_task_id(19);
+// Task IDs (range 0-15, safe from system library conflicts at 21/27/28)
+const gemv_task_id: local_task_id = @get_local_task_id(0);
+const reduce_done_task_id: local_task_id = @get_local_task_id(1);
 
 // =============================================================================
-// Bulk fabin receive: DMA entire B column directly into b_bufs, no per-wavelet tasks
+// Sequential broadcast: one (source, column) per round
+//
+// Flow per round:
+//   1. ALL PEs: arm async fabin on bcast_rx_color → b_vec
+//   2. Source PE: synchronous send on bcast_tx_color
+//      Head PE reflector cross-routes TX → RX, broadcasts DOWN
+//   3. Source PE: send SWITCH_ADV if needed (after source 0 or last source)
+//   4. fabin completes → gemv_task fires
+//   5. GEMV → reduce_async → reduce_done_task → next round
 // =============================================================================
+fn start_round() void {
+    // Arm bulk receive: head PE's reflector cross-routes TX→RX,
+    // so ALL PEs (including head) receive on bcast_rx_color.
+    @fmovs(b_vec_dsd, fabin_rx_dsd, .{ .async = true, .activate = gemv_task_id });
 
-// recv_done task IDs — skip 21 (memcpyd2h LOCAL_MEMCPYD2H_DATA) and 27 (memcpy SYS_UBLK_C22)
-const recv_done_0_id: local_task_id = @get_local_task_id(20);
-const recv_done_1_id: local_task_id = @get_local_task_id(22);  // skip 21
-const recv_done_2_id: local_task_id = @get_local_task_id(23);
-const recv_done_3_id: local_task_id = @get_local_task_id(24);
-const recv_done_4_id: local_task_id = @get_local_task_id(25);
-const recv_done_5_id: local_task_id = @get_local_task_id(26);
-const recv_done_6_id: local_task_id = @get_local_task_id(28);  // skip 27
-const recv_done_7_id: local_task_id = @get_local_task_id(29);
+    // If I'm the current source PE, synchronous send my B column on TX
+    if (my_y == proc_source) {
+        var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
+        b_dsd = @increment_dsd_offset(b_dsd, proc_col * dH, f32);
+        @fmovs(fabout_tx_dsd, b_dsd, .{}); // synchronous: CE blocks until OQ drained
 
-// arm_recv: issue async bulk DMA receive for stream s, current column.
-// Each branch uses comptime-constant color and IQ (required by @get_dsd / @get_input_queue).
-// IQ = stream index (0..7); fabric delivers dH elements directly into b_bufs.
-// IQ 0 and IQ 1 are reused for ring-reduce/flyover after broadcast phase completes.
-fn arm_recv(stream: i16) void {
-    const col = b_buf_col[stream];
-    if (col >= dN_y) return;
-
-    var buf_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &b_bufs, .extent = dH });
-    buf_dsd = @increment_dsd_offset(buf_dsd, stream * dN_y * dH + col * dH, f32);
-
-    if (stream == 0) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_0, .extent = dH, .input_queue = @get_input_queue(0) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_0_id });
-    } else if (stream == 1) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_1, .extent = dH, .input_queue = @get_input_queue(1) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_1_id });
-    } else if (stream == 2) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_2, .extent = dH, .input_queue = @get_input_queue(2) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_2_id });
-    } else if (stream == 3) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_3, .extent = dH, .input_queue = @get_input_queue(3) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_3_id });
-    } else if (stream == 4) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_4, .extent = dH, .input_queue = @get_input_queue(4) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_4_id });
-    } else if (stream == 5) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_5, .extent = dH, .input_queue = @get_input_queue(5) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_5_id });
-    } else if (stream == 6) {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_6, .extent = dH, .input_queue = @get_input_queue(6) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_6_id });
-    } else {
-        const r = @get_dsd(fabin_dsd, .{ .fabric_color = bcast_color_7, .extent = dH, .input_queue = @get_input_queue(7) });
-        @fmovs(buf_dsd, r, .{ .async = true, .activate = recv_done_7_id });
+        // SWITCH_ADV: toggle head PE's switch for next round
+        //   After source 0: pos1→pos2 (next source comes from SOUTH)
+        //   After last source: pos2→pos1 (next column starts with head PE = source 0)
+        if (proc_source == 0) {
+            send_switch_adv();
+        } else if (proc_source == kernel_y_dim - 1) {
+            send_switch_adv();
+        }
     }
+    // CE returns; async fabin will fire gemv_task when dH wavelets arrive
 }
-
-fn handle_recv_done(stream: i16) void {
-    stream_cols_ready[stream] += 1;
-    b_buf_col[stream] += 1;
-    arm_recv(stream);  // pre-arm next column DMA
-    if (sends_done) { try_start_gemv(); }
-}
-
-fn try_start_gemv() void {
-    if (gemv_active) return;
-    if (proc_source >= kernel_y_dim) return;
-    if (stream_cols_ready[proc_source] > 0) {
-        gemv_active = true;
-        @activate(gemv_task_id);
-    }
-}
-
-// One completion task per broadcast source (fires when full column DMA'd into b_bufs)
-task recv_done_0() void { handle_recv_done(0); }
-task recv_done_1() void { handle_recv_done(1); }
-task recv_done_2() void { handle_recv_done(2); }
-task recv_done_3() void { handle_recv_done(3); }
-task recv_done_4() void { handle_recv_done(4); }
-task recv_done_5() void { handle_recv_done(5); }
-task recv_done_6() void { handle_recv_done(6); }
-task recv_done_7() void { handle_recv_done(7); }
 
 // =============================================================================
-// GEMV task: process one buffered B column
+// GEMV task: accum += A * b_vec (one column, optimized DSD)
 // =============================================================================
 task gemv_task() void {
-    const s = proc_source;
-    const b_base: u16 = @as(u16, s * dN_y * dH + proc_col * dH);
-
-    // GEMV: accum += A * b_bufs[s, proc_col, :]
-    // Precompute base A-column DSD once; increment by dM each iteration
+    // Precompute base A-column DSD; advance by dM per h iteration
+    // A is stored column-major (A_MEMORY_TRANSPOSE=True): column h at offset h*dM
     var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
     var h: i16 = 0;
     while (h < dH) : (h += 1) {
-        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_bufs[b_base + @as(u16, h)]);
+        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_vec[@as(u16, h)]);
         if (h + 1 < dH) {
             a_col_dsd = @increment_dsd_offset(a_col_dsd, dM, f32);
         }
     }
 
-    // Launch async ring reduction
-    const global_col = s * dN_y + proc_col;
+    // Launch async ring reduction for this partial column
+    const global_col = proc_source * dN_y + proc_col;
     reduce_async(global_col);
 }
 
 // =============================================================================
-// Async Ring Reduction
+// Async Ring Reduction (unchanged)
 // =============================================================================
 fn reduce_async(global_col: i16) void {
     const my_x = @as(i16, layout_mod.get_x_coord());
@@ -260,14 +241,11 @@ fn reduce_async(global_col: i16) void {
 }
 
 // =============================================================================
-// Reduce done: clear accum, advance state, chain to next GEMV
+// Reduce done: clear accum, advance state, chain to next round
 // =============================================================================
 task reduce_done_task() void {
     // Clear accumulator
     @fmovs(accum_dsd, zeros_dsd, .{});
-
-    // Consume one ready column from current source
-    stream_cols_ready[proc_source] -= 1;
 
     // Advance processing state (round-robin: cycle sources for each col)
     proc_source += 1;
@@ -282,36 +260,8 @@ task reduce_done_task() void {
         return;
     }
 
-    // Try to start next GEMV
-    gemv_active = false;
-    try_start_gemv();
-}
-
-// =============================================================================
-// Send B Data — async send, one column at a time; CE free during fabric I/O
-// send_done_task chains to the next column or signals sends complete
-// =============================================================================
-task send_b_task() void {
-    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-    b_dsd = @increment_dsd_offset(b_dsd, send_col * dH, f32);
-
-    const out_dsd = @get_dsd(fabout_dsd, .{
-        .fabric_color = my_bcast_color,
-        .extent = dH,
-        .output_queue = broadcast_oq,
-    });
-    send_col += 1;
-    @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
-}
-
-task send_done_task() void {
-    if (send_col < dN_y) {
-        @activate(send_task_id);  // send next column; data tasks may run in between
-    } else {
-        // All sends complete — async microthread released; safe to start reductions
-        sends_done = true;
-        try_start_gemv();
-    }
+    // Chain to next broadcast round
+    start_round();
 }
 
 // =============================================================================
@@ -319,19 +269,7 @@ task send_done_task() void {
 // =============================================================================
 fn broadcast_pe() void {
     start_timer();
-
-    // Pre-arm bulk fabin DMA for each broadcast source (column 0 of each stream).
-    // Must be issued before sends start so IQ hardware captures arriving wavelets.
-    arm_recv(0);
-    arm_recv(1);
-    if (kernel_y_dim > 2) { arm_recv(2); }
-    if (kernel_y_dim > 3) { arm_recv(3); }
-    if (kernel_y_dim > 4) { arm_recv(4); }
-    if (kernel_y_dim > 5) { arm_recv(5); }
-    if (kernel_y_dim > 6) { arm_recv(6); }
-    if (kernel_y_dim > 7) { arm_recv(7); }
-
-    @activate(send_task_id);  // start async send chain
+    start_round();
 }
 
 fn terminate_kernel() void {
@@ -342,23 +280,9 @@ fn terminate_kernel() void {
 comptime {
     @comptime_assert(@is_arch("wse2"));
 
-    // No @bind_data_task: broadcast colors now consumed via bulk fabin_dsd in arm_recv()
-
-    // Bind local tasks
-    @bind_local_task(send_b_task, send_task_id);
-    @bind_local_task(send_done_task, send_done_task_id);
+    // Bind local tasks (IDs 0-1, safe range far from system IDs 21/27/28)
     @bind_local_task(gemv_task, gemv_task_id);
     @bind_local_task(reduce_done_task, reduce_done_task_id);
-
-    // Bind bulk recv completion tasks (one per source stream)
-    @bind_local_task(recv_done_0, recv_done_0_id);
-    @bind_local_task(recv_done_1, recv_done_1_id);
-    if (kernel_y_dim > 2) { @bind_local_task(recv_done_2, recv_done_2_id); }
-    if (kernel_y_dim > 3) { @bind_local_task(recv_done_3, recv_done_3_id); }
-    if (kernel_y_dim > 4) { @bind_local_task(recv_done_4, recv_done_4_id); }
-    if (kernel_y_dim > 5) { @bind_local_task(recv_done_5, recv_done_5_id); }
-    if (kernel_y_dim > 6) { @bind_local_task(recv_done_6, recv_done_6_id); }
-    if (kernel_y_dim > 7) { @bind_local_task(recv_done_7, recv_done_7_id); }
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
