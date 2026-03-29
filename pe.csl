@@ -139,7 +139,7 @@ const reflect_tx_dsd = @get_dsd(fabout_dsd, .{
 //   - After source 0 sends (pos1 → pos2, ready for source 1+)
 //   - After last source sends (pos2 → pos1, ready for next column's source 0)
 // The control wavelet payload encodes SWITCH_ADV opcode.
-var switch_adv_buf: [1]u32 = .{1}; // SWITCH_ADV payload (adjust encoding if needed)
+var switch_adv_buf = [1]u32 { 1 }; // SWITCH_ADV payload (adjust encoding if needed)
 const switch_adv_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &switch_adv_buf, .extent = 1 });
 
 fn send_switch_adv() void {
