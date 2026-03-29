@@ -18,6 +18,8 @@ const timestamp = @import_module("<time>");
 
 // Comptime PE coordinate (used for head-PE vs non-head branching)
 // const my_y = @as(i16, layout_mod.get_y_coord());
+param my_x: i16;
+param my_y: i16;
 
 // =============================================================================
 // TSC timer buffers
