@@ -1,4 +1,4 @@
-// Color map (2-color broadcast via head PE reflector + SWITCH_ADV)
+// Color map (2-color broadcast via head PE CE reflector)
 //  ID var                   ID var       ID var               ID var
 //   0 bcast_rx_color        9  (free)   18                   27 reserved (memcpy)
 //   1 bcast_tx_color        10 (free)   19                   28 reserved (memcpy)
@@ -35,8 +35,9 @@ const reduce_A_color: color = @get_color(5);
 const reduce_B_color: color = @get_color(6);
 const reduce_C_color: color = @get_color(7);
 
-// Broadcast: 2 colors — TX (up to head PE) and RX (down from head PE)
-// Head PE reflects TX → RX via hardware cross-color routing
+// Broadcast: 2 colors
+//   bcast_tx_color: PEs send B-segments UP to head PE (pe_y=0)
+//   bcast_rx_color: Head PE CE-relay broadcasts DOWN to all PEs
 const bcast_tx_color: color = @get_color(1);
 const bcast_rx_color: color = @get_color(0);
 
@@ -53,7 +54,6 @@ layout {
   // PE coordinates are (column, row)
   @set_rectangle(kernel_x_dim, kernel_y_dim);
 
-  // PE rectangle dimensions should evenly divide matrix dimensions
   @comptime_assert(M % kernel_y_dim == 0);
   @comptime_assert(H % kernel_x_dim == 0);
   @comptime_assert(N % kernel_y_dim == 0);
@@ -100,41 +100,54 @@ layout {
       }
 
       // =================================================================
-      // Broadcast routing: 2-color reflector with SWITCH_ADV at head PE
+      // Broadcast TX routing (bcast_tx_color): PEs send B-segments NORTH
       //
-      // TX path (bcast_tx_color): PEs send B-segments NORTH to head PE
-      //   - Head PE: terminates, cross-color routes output to bcast_rx_color
-      //     Switch pos1 (rx=RAMP): head PE sends own data
-      //     Switch pos2 (rx=SOUTH): forwarded data from below
-      //   - Other PEs: forward from RAMP/SOUTH to NORTH
+      // Head PE (pe_y=0):
+      //   Receives from RAMP (self-send) or SOUTH (forwarded from below)
+      //   Delivers to RAMP for CE reflector (head_reflector_task)
+      //   Switches: pos1=RAMP (head is source), pos2=SOUTH (other PE is source)
+      //   SWITCH_ADV toggles between pos1 and pos2 at each source change
       //
-      // RX path (bcast_rx_color): head PE reflects data DOWN to all PEs
-      //   - Head PE: receives from TX crossover, broadcasts SOUTH + RAMP
-      //   - Other PEs: receive from NORTH, forward SOUTH + deliver to RAMP
-      //   - Bottom PE: terminal, deliver to RAMP only
+      // Other PEs:
+      //   Receives from RAMP (self-send) or SOUTH (forwarding from below)
+      //   Forwards NORTH toward head PE
       // =================================================================
       if (pe_y == 0) {
-        // Head PE: reflect TX → RX via hardware cross-color routing
+        // Head PE: terminate TX at RAMP (CE reflector reads from here)
         @set_color_config(pe_x, pe_y, bcast_tx_color, .{
-          .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{bcast_rx_color} },
+          .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{RAMP} },
           .switches = .{ .pos1 = .{ .rx = RAMP }, .pos2 = .{ .rx = SOUTH } },
         });
-        @set_color_config(pe_x, pe_y, bcast_rx_color, .{
-          .routes = .{ .rx = .{bcast_tx_color}, .tx = .{SOUTH, RAMP} },
-        });
-      } else if (pe_y == kernel_y_dim - 1) {
-        // Bottom PE: TX forwards NORTH, RX terminal (RAMP only)
+      } else {
+        // Non-head PE: forward from RAMP/SOUTH to NORTH
         @set_color_config(pe_x, pe_y, bcast_tx_color, .{
           .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{NORTH} },
         });
+      }
+
+      // =================================================================
+      // Broadcast RX routing (bcast_rx_color): head PE CE-relay broadcasts DOWN
+      //
+      // Head PE (pe_y=0):
+      //   Receives from RAMP (CE reflector writes here)
+      //   Broadcasts SOUTH + self-deliver via RAMP (for head PE's own GEMV)
+      //
+      // Other PEs:
+      //   Receives from NORTH
+      //   Forwards SOUTH + delivers to RAMP (for GEMV)
+      // =================================================================
+      if (pe_y == 0) {
+        // Head PE: CE reflector sends here, broadcasts SOUTH + self-receive
+        @set_color_config(pe_x, pe_y, bcast_rx_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} },
+        });
+      } else if (pe_y == kernel_y_dim - 1) {
+        // Bottom PE: terminal — deliver to RAMP only
         @set_color_config(pe_x, pe_y, bcast_rx_color, .{
           .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} },
         });
       } else {
-        // Middle PE: TX forwards NORTH, RX forwards SOUTH + delivers RAMP
-        @set_color_config(pe_x, pe_y, bcast_tx_color, .{
-          .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{NORTH} },
-        });
+        // Middle PE: forward SOUTH + deliver to RAMP
         @set_color_config(pe_x, pe_y, bcast_rx_color, .{
           .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
         });
@@ -142,8 +155,6 @@ layout {
 
       // =================================================================
       // Reduction EAST chain routing (checkerboard) — unchanged
-      // Even PEs: send on reduce_A (RAMP->EAST), recv on reduce_B (WEST->RAMP)
-      // Odd PEs:  send on reduce_B (RAMP->EAST), recv on reduce_A (WEST->RAMP)
       // =================================================================
       if (pe_x % 2 == 0) {
         @set_color_config(pe_x, pe_y, reduce_A_color, .{

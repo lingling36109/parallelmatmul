@@ -57,6 +57,11 @@ const flyover_color: color = scatter_color;
 const flyover_oq: output_queue = @get_output_queue(4);
 const flyover_iq: input_queue = @get_input_queue(4);
 
+// Head PE reflector: bridges bcast_tx_color → bcast_rx_color (IQ 5 / OQ 5)
+// IQ 5 and OQ 5 are free; they don't overlap with reduce (IQ 2/OQ 3) or flyover (IQ 4/OQ 4).
+const bcast_reflect_iq: input_queue = @get_input_queue(5);
+const bcast_reflect_oq: output_queue = @get_output_queue(5);
+
 // =============================================================================
 // Storage
 // =============================================================================
@@ -106,6 +111,23 @@ const ctrl_dsd = @get_dsd(fabout_dsd, .{
 });
 
 // =============================================================================
+// Head PE reflector DSDs (only used when my_y == 0)
+// =============================================================================
+// Receive: read one B column (dH elements) arriving at head PE on bcast_tx_color
+const reflect_rx_dsd = @get_dsd(fabin_dsd, .{
+    .fabric_color = bcast_tx_color,
+    .extent = dH,
+    .input_queue = bcast_reflect_iq,
+});
+
+// Transmit: forward it out on bcast_rx_color, which routes SOUTH+RAMP to all PEs
+const reflect_tx_dsd = @get_dsd(fabout_dsd, .{
+    .fabric_color = bcast_rx_color,
+    .extent = dH,
+    .output_queue = bcast_reflect_oq,
+});
+
+// =============================================================================
 // SWITCH_ADV control wavelet
 // =============================================================================
 // The head PE's bcast_tx_color switch has 2 positions:
@@ -134,6 +156,7 @@ var total_reduces_done: i16 = 0;
 // Task IDs (range 0-15, safe from system library conflicts at 21/27/28)
 const gemv_task_id: local_task_id = @get_local_task_id(0);
 const reduce_done_task_id: local_task_id = @get_local_task_id(1);
+const reflect_task_id: local_task_id = @get_local_task_id(2);
 
 // =============================================================================
 // Sequential broadcast: one (source, column) per round
@@ -265,6 +288,21 @@ task reduce_done_task() void {
 }
 
 // =============================================================================
+// Head PE reflector: continuous B-column relay bcast_tx → bcast_rx
+//
+// Activated once at kernel startup (via comptime @activate).
+// Each invocation issues one async fabric-to-fabric DMA:
+//   read dH elements from bcast_tx_color IQ 5  (arriving from source PEs)
+//   write dH elements to   bcast_rx_color OQ 5  (routed SOUTH + RAMP → all PEs)
+// On DMA completion, reactivates itself to pre-arm the next column's relay.
+// This runs for the entire kernel; the hanging arm after the last column is
+// harmless because the kernel terminates via unblock_cmd_stream().
+// =============================================================================
+task head_reflector_task() void {
+    @fmovs(reflect_tx_dsd, reflect_rx_dsd, .{ .async = true, .activate = reflect_task_id });
+}
+
+// =============================================================================
 // Entry point
 // =============================================================================
 fn broadcast_pe() void {
@@ -280,9 +318,17 @@ fn terminate_kernel() void {
 comptime {
     @comptime_assert(@is_arch("wse2"));
 
-    // Bind local tasks (IDs 0-1, safe range far from system IDs 21/27/28)
+    // Bind local tasks
     @bind_local_task(gemv_task, gemv_task_id);
     @bind_local_task(reduce_done_task, reduce_done_task_id);
+
+    // Head PE (my_y == 0): bind and immediately activate the reflector.
+    // @activate in comptime schedules the task to fire at kernel startup,
+    // pre-arming the first async relay DMA before any source PE begins sending.
+    if (my_y == 0) {
+        @bind_local_task(head_reflector_task, reflect_task_id);
+        @activate(reflect_task_id);
+    }
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
