@@ -13,11 +13,9 @@ param reduce_rx_color: color;
 param scatter_color: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
-const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-// Comptime PE coordinate (used for head-PE vs non-head branching)
-// const my_y = @as(i16, layout_mod.get_y_coord());
+// Comptime PE coordinates (passed from layout.csl)
 param my_x: i16;
 param my_y: i16;
 
@@ -218,7 +216,7 @@ task gemv_task() void {
 // Async Ring Reduction (unchanged)
 // =============================================================================
 fn reduce_async(global_col: i16) void {
-    const my_x = @as(i16, layout_mod.get_x_coord());
+    // my_x is a comptime param from layout.csl — no layout_mod needed
 
     const fsum_pe = global_col / dN;
     const isum_pe = (fsum_pe + 1) % kernel_x_dim;
