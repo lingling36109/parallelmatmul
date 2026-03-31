@@ -154,9 +154,12 @@ var proc_col: i16 = 0;     // current B column index (0..dN_y-1)
 var total_reduces_done: i16 = 0;
 
 // Task IDs (range 0-15, safe from system library conflicts at 21/27/28)
-const gemv_task_id: local_task_id = @get_local_task_id(0);
-const reduce_done_task_id: local_task_id = @get_local_task_id(1);
-const reflect_task_id: local_task_id = @get_local_task_id(2);
+// reflect_task_id MUST be lowest numerical ID (highest priority) so the reflector
+// re-arms color 1 before reduce_done_task runs start_round() and sends on color 1.
+// Without this ordering, a wavelet can arrive on color 1 while it is unblocked.
+const reflect_task_id: local_task_id = @get_local_task_id(0);
+const gemv_task_id: local_task_id = @get_local_task_id(1);
+const reduce_done_task_id: local_task_id = @get_local_task_id(2);
 
 // =============================================================================
 // Sequential broadcast: one (source, column) per round
