@@ -81,36 +81,15 @@ task send_b_task() void {
     cols_sent += 1;
 }
 
-// Intercepts the upward route and shifts to the downward route
-// Also buffers B data for y=0 PE's own computation (Optimization A + C)
+// Intercepts the upward route and shifts to the downward route (y=0 only)
 task color_swap_task(data: f32) void {
-    // Forward to broadcast_tx_color (original behavior)
     var out_dsd = @get_dsd(fabout_dsd, .{
         .fabric_color = broadcast_tx_color,
         .extent = 1,
         .output_queue = broadcast_oq
     });
+
     @fmovs(out_dsd, data);
-
-    // Buffer for local computation
-    buf_B[buf_idx * dH + elements_received] = data;
-    elements_received += 1;
-
-    if (elements_received == dH) {
-        elements_received = 0;
-        compute_buf_idx = buf_idx;
-        buf_idx = 1 - buf_idx;
-        @activate(compute_task_id);
-
-        cols_received += 1;
-        current_row += 1;
-        if (current_row == kernel_y_dim) {
-            current_row = 0;
-        }
-        if (@as(u16, current_row) == layout_mod.get_y_coord() and cols_sent < dN_y) {
-            @activate(send_task_id);
-        }
-    }
 }
 
 // Lightweight store-only data task (Optimization A + C)
