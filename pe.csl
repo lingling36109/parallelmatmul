@@ -65,8 +65,10 @@ var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
 
-// Profiling counters — u16 is sufficient (max ~65535 per counter, we sum in Python)
-// Per-batch accumulators, stored at batch boundaries
+// Profiling: accumulate cycle counts per phase.
+// We use the lower 16 bits of TSC for per-phase deltas (each phase < 65536 cy).
+// Totals can exceed 65536, so we use two u16 words per counter (lo + hi).
+// time_buf_u16[6..7] = GEMV, [8..9] = reduce, [10..11] = copy, [12..13] = overhead
 var prof_gemv_lo: u16 = 0;
 var prof_gemv_hi: u16 = 0;
 var prof_reduce_lo: u16 = 0;
@@ -75,7 +77,6 @@ var prof_copy_lo: u16 = 0;
 var prof_copy_hi: u16 = 0;
 var prof_overhead_lo: u16 = 0;
 var prof_overhead_hi: u16 = 0;
-
 var prof_tmp: [timestamp.tsc_size_words]u16 = @zeros([timestamp.tsc_size_words]u16);
 
 fn read_tsc_lo() u16 {
@@ -83,22 +84,12 @@ fn read_tsc_lo() u16 {
     return prof_tmp[0];
 }
 
-fn read_tsc_hi() u16 {
-    return prof_tmp[1];
-}
-
-fn add_delta(lo: *u16, hi: *u16, start_lo: u16, start_hi: u16, end_lo: u16, end_hi: u16) void {
-    // Add (end - start) to the running accumulator, handling carry
-    const old_lo = lo.*;
-    lo.* +%= end_lo -% start_lo;
-    // Carry if lo wrapped
-    if (lo.* < old_lo) {
-        hi.* += 1;
-    }
-    hi.* +%= end_hi -% start_hi;
-    // Adjust for borrow in low word
-    if (end_lo < start_lo) {
-        hi.* -%= 1;
+fn prof_add(lo_ptr: *u16, hi_ptr: *u16, delta: u16) void {
+    const old = lo_ptr.*;
+    lo_ptr.* = old + delta;
+    // If lo wrapped around, increment hi
+    if (lo_ptr.* < old) {
+        hi_ptr.* = hi_ptr.* + 1;
     }
 }
 
@@ -164,25 +155,21 @@ const batch_done_id: local_task_id = @get_local_task_id(13);
 // Batch Done Task — process all dN_y columns, then arm next batch receive
 // =============================================================================
 task batch_done_task() void {
-    const t_batch_lo = read_tsc_lo();
-    const t_batch_hi = read_tsc_hi();
+    const t_batch = read_tsc_lo();
     batch_count += 1;
 
     // Process all dN_y columns in this batch
     var col: i16 = 0;
     while (col < dN_y) {
         // --- Copy column from batch_B to work_B ---
-        const t0_lo = read_tsc_lo();
-        const t0_hi = read_tsc_hi();
+        const t0 = read_tsc_lo();
 
         var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
         src = @increment_dsd_offset(src, col * dH, f32);
         @fmovs(work_B_dsd, src, .{});
 
-        const t1_lo = read_tsc_lo();
-        const t1_hi = read_tsc_hi();
-
-        add_delta(&prof_copy_lo, &prof_copy_hi, t0_lo, t0_hi, t1_lo, t1_hi);
+        const t1 = read_tsc_lo();
+        prof_add(&prof_copy_lo, &prof_copy_hi, t1 - t0);
 
         col_count += 1;
 
@@ -194,8 +181,7 @@ task batch_done_task() void {
         }
 
         // --- GEMV: red_in += A * work_B ---
-        const t2_lo = read_tsc_lo();
-        const t2_hi = read_tsc_hi();
+        const t2 = read_tsc_lo();
 
         var h: i16 = 0;
         while (h < dH) {
@@ -207,32 +193,24 @@ task batch_done_task() void {
             h += 1;
         }
 
-        const t3_lo = read_tsc_lo();
-        const t3_hi = read_tsc_hi();
-
-        add_delta(&prof_gemv_lo, &prof_gemv_hi, t2_lo, t2_hi, t3_lo, t3_hi);
+        const t3 = read_tsc_lo();
+        prof_add(&prof_gemv_lo, &prof_gemv_hi, t3 - t2);
 
         // --- Synchronous reduce ---
-        const t4_lo = read_tsc_lo();
-        const t4_hi = read_tsc_hi();
+        const t4 = read_tsc_lo();
 
         reduce();
 
-        const t5_lo = read_tsc_lo();
-        const t5_hi = read_tsc_hi();
-
-        add_delta(&prof_reduce_lo, &prof_reduce_hi, t4_lo, t4_hi, t5_lo, t5_hi);
+        const t5 = read_tsc_lo();
+        prof_add(&prof_reduce_lo, &prof_reduce_hi, t5 - t4);
 
         col += 1;
     }
 
     // Arm next batch receive if more batches expected
     if (batch_count < kernel_y_dim) {
-        const t6_lo = read_tsc_lo();
-        const t6_hi = read_tsc_hi();
-
-        add_delta(&prof_overhead_lo, &prof_overhead_hi, t_batch_lo, t_batch_hi, t6_lo, t6_hi);
-
+        const t6 = read_tsc_lo();
+        prof_add(&prof_overhead_lo, &prof_overhead_hi, t6 - t_batch);
         @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
     }
 }
