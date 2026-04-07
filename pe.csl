@@ -64,9 +64,9 @@ var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
 
-// Receive buffer — incoming column data lands here
-var buf_B: [dH]f32 = @zeros([dH]f32);
-const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
+// Batch receive buffer — holds dN_y columns (one sending PE's worth)
+var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
+const batch_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dN_y * dH });
 
 // Work buffer — GEMV reads from here (fixed base, comptime offsets)
 var work_B: [dH]f32 = @zeros([dH]f32);
@@ -81,10 +81,10 @@ const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
-// DSD for streaming receive from broadcast fabric
-const fabin_broadcast = @get_dsd(fabin_dsd, .{
+// DSD for batch streaming receive from broadcast fabric
+const fabin_batch = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_rx_color,
-    .extent = dH,
+    .extent = dN_y * dH,
     .input_queue = broadcast_iq,
 });
 
@@ -96,6 +96,7 @@ var fsum_count: i16 = 0;
 var col_count: i16 = 0;
 var has_sent: bool = false;
 var send_col: i16 = 0;
+var batch_count: i16 = 0;
 
 // Pre-computed values (set in broadcast_pe)
 var my_x_val: i16 = 0;
@@ -108,44 +109,52 @@ const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
-const column_done_id: local_task_id = @get_local_task_id(13);
+const batch_done_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// Column Done Task — copy, arm next receive, then GEMV + reduce
+// Batch Done Task — process all dN_y columns, then arm next batch receive
 // =============================================================================
-task column_done_task() void {
-    // 1. Copy received data to work buffer (sync, ~dH cycles).
-    //    Also provides safe gap for previous receive's microthread slot to retire.
-    @fmovs(work_B_dsd, buf_B_dsd, .{});
+task batch_done_task() void {
+    batch_count += 1;
 
-    // 2. Arm receive for NEXT column into buf_B (async).
-    //    fabin stays ACTIVE during the entire GEMV+reduce (~750 cycles),
-    //    preventing backpressure on incoming wavelets.
-    col_count += 1;
-    if (col_count < total_columns) {
-        @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
-    }
+    // Process all dN_y columns in this batch
+    var col: i16 = 0;
+    while (col < dN_y) {
+        // Copy column from batch_B to work_B (sync, preserves comptime GEMV indexing)
+        var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
+        src = @increment_dsd_offset(src, col * dH, f32);
+        @fmovs(work_B_dsd, src, .{});
 
-    // 3. Trigger own B send
-    if (!has_sent) {
-        if (col_count >= my_send_start_col) {
-            @activate(send_task_id);
+        col_count += 1;
+
+        // Trigger own B send at the right time
+        if (!has_sent) {
+            if (col_count >= my_send_start_col) {
+                @activate(send_task_id);
+            }
         }
+
+        // GEMV: red_in += A * work_B — fixed base address, comptime h after unroll
+        var h: i16 = 0;
+        while (h < dH) {
+            const a_col = @increment_dsd_offset(
+                @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
+                h * dM, f32
+            );
+            @fmacs(red_in_dsd, red_in_dsd, a_col, work_B[h]);
+            h += 1;
+        }
+
+        // Synchronous reduce
+        reduce();
+
+        col += 1;
     }
 
-    // 4. GEMV: red_in += A * work_B — fixed base address, comptime h after unroll
-    var h: i16 = 0;
-    while (h < dH) {
-        const a_col = @increment_dsd_offset(
-            @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
-            h * dM, f32
-        );
-        @fmacs(red_in_dsd, red_in_dsd, a_col, work_B[h]);
-        h += 1;
+    // Arm next batch receive if more batches expected
+    if (batch_count < kernel_y_dim) {
+        @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
     }
-
-    // 5. Synchronous reduce
-    reduce();
 }
 
 // =============================================================================
@@ -275,8 +284,8 @@ fn broadcast_pe() void {
     my_x_val = @as(i16, layout_mod.get_x_coord());
     my_send_start_col = @as(i16, my_y_val) * dN_y;
 
-    // Arm first column receive into buf_B
-    @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
+    // Arm batch 0 receive (dN_y * dH wavelets from first sending PE)
+    @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
 
     if (my_y_val == 0) {
         @activate(send_task_id);
@@ -293,7 +302,7 @@ comptime {
 
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
-    @bind_local_task(column_done_task, column_done_id);
+    @bind_local_task(batch_done_task, batch_done_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
