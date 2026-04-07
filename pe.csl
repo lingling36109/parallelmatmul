@@ -20,7 +20,7 @@ const zeros_buf = @zeros([dM]f32);
 var buf_B: [dH]f32;
 
 // Sync wavelet source buffer
-var sync_buf: [1]f32 = .{0.0};
+var sync_buf: [1]f32 = @zeros([1]f32);
 
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
