@@ -135,22 +135,7 @@ task batch_done_task() void {
     // For each h value, process ALL dN_y columns before moving to next h.
     // Benefits: eliminates work_B copy, reuses A-column DSD across j iterations,
     // different accumulators per j → no write-port contention.
-
-    // h=0: overwrite accumulators (clears + first multiply in one op)
-    {
-        const a_col_0 = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-        var j: i16 = 0;
-        while (j < j_limit) {
-            const scalar = batch_B[@as(u16, j * dH)];
-            var acc_j = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
-            acc_j = @increment_dsd_offset(acc_j, j * dM, f32);
-            @fmacs(acc_j, zeros_dsd, a_col_0, scalar);
-            j += 1;
-        }
-    }
-
-    // h=1..dH-1: accumulate
-    var h: i16 = 1;
+    var h: i16 = 0;
     while (h < h_limit) {
         // Set up A-column DSD once per h, reused across all j
         var a_col = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
@@ -158,10 +143,20 @@ task batch_done_task() void {
 
         var j: i16 = 0;
         while (j < j_limit) {
+            // Read scalar directly from batch_B — no copy needed
             const scalar = batch_B[@as(u16, j * dH + h)];
+
+            // Build accumulator DSD for column j
             var acc_j = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
             acc_j = @increment_dsd_offset(acc_j, j * dM, f32);
-            @fmacs(acc_j, acc_j, a_col, scalar);
+
+            if (h == 0) {
+                // h=0: overwrite (clear + multiply in one op)
+                @fmacs(acc_j, zeros_dsd, a_col, scalar);
+            } else {
+                // h>0: accumulate
+                @fmacs(acc_j, acc_j, a_col, scalar);
+            }
             j += 1;
         }
         h += 1;
