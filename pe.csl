@@ -59,10 +59,7 @@ var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-// Double-buffered partial sum accumulators
-var red_in_0: [dM]f32 = @zeros([dM]f32);
-var red_in_1: [dM]f32 = @zeros([dM]f32);
-var red_sel: i16 = 0; // which red_in buffer is active for current GEMV
+var red_in: [dM]f32 = @zeros([dM]f32);
 
 // B-column receive buffer (store-then-compute)
 var buf_B: [dH]f32 = @zeros([dH]f32);
@@ -70,6 +67,7 @@ var buf_B: [dH]f32 = @zeros([dH]f32);
 // =============================================================================
 // DSDs
 // =============================================================================
+const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
 const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 
 const zeros_buf = @zeros([dM]f32);
@@ -91,7 +89,6 @@ const relay_task_id: data_task_id = @get_data_task_id(broadcast_tx_color);
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
 const gemv_task_id: local_task_id = @get_local_task_id(13);
-const reduce_done_id: local_task_id = @get_local_task_id(14);
 
 // =============================================================================
 // Broadcast Receive Task — store only (~1 cycle per wavelet)
@@ -116,15 +113,9 @@ task recv_broadcast_task(in_data: f32) void {
 }
 
 // =============================================================================
-// GEMV Task — batched compute after full B column received
+// GEMV Task — batched compute after full B column received, then sync reduce
 // =============================================================================
 task gemv_task() void {
-    // Select the active red_in buffer
-    var cur_red_in_dsd = if (red_sel == 0)
-        @get_dsd(mem1d_dsd, .{ .base_address = &red_in_0, .extent = dM })
-    else
-        @get_dsd(mem1d_dsd, .{ .base_address = &red_in_1, .extent = dM });
-
     // Batched GEMV: red_in += A * buf_B (unrolled by --max-inlined-iterations 150)
     var h: i16 = 0;
     while (h < dH) {
@@ -132,7 +123,7 @@ task gemv_task() void {
             @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
             h * dM, f32
         );
-        @fmacs(cur_red_in_dsd, cur_red_in_dsd, a_col, buf_B[h]);
+        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B[h]);
         h += 1;
     }
 
@@ -192,7 +183,7 @@ task send_done_task() void {
 }
 
 // =============================================================================
-// Rotating Ring Reduction — async with double-buffered red_in
+// Rotating Ring Reduction (Synchronous)
 // =============================================================================
 fn reduce() void {
     const my_x = @as(i16, layout_mod.get_x_coord());
@@ -202,12 +193,6 @@ fn reduce() void {
 
     var c_col_dsd = C_dsd;
     c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
-
-    // Select the red_in buffer for this reduce (current red_sel, before toggle)
-    const red_in_dsd = if (red_sel == 0)
-        @get_dsd(mem1d_dsd, .{ .base_address = &red_in_0, .extent = dM })
-    else
-        @get_dsd(mem1d_dsd, .{ .base_address = &red_in_1, .extent = dM });
 
     const fabin_reduce = @get_dsd(fabin_dsd, .{
         .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
@@ -223,46 +208,32 @@ fn reduce() void {
     });
 
     if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, red_in_dsd, .{ .async = true, .activate = reduce_done_id });
+        @fmovs(c_col_dsd, red_in_dsd, .{});
         fsum_count += 1;
     } else if (my_x == isum_pe) {
         if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, red_in_dsd, .{ .async = true, .activate = reduce_done_id });
+            @fmovs(fabout_flyover, red_in_dsd, .{});
         } else {
-            @fmovs(fabout_reduce, red_in_dsd, .{ .async = true, .activate = reduce_done_id });
+            @fmovs(fabout_reduce, red_in_dsd, .{});
         }
     } else if (my_x == fsum_pe) {
         if (my_x == 0) {
-            @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_id });
+            @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{});
         } else {
-            @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_id });
+            @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{});
         }
         fsum_count += 1;
     } else {
         if (my_x == 0) {
-            @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_id });
+            @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{});
         } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_id });
+            @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{});
         } else {
-            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_id });
+            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{});
         }
     }
 
-    // Toggle buffer for next GEMV (next column will use the other red_in)
-    red_sel = 1 - red_sel;
-}
-
-// =============================================================================
-// Reduce Done Task — cleanup after async reduce completes
-// =============================================================================
-task reduce_done_task() void {
-    // Zero the buffer that was just consumed (the one we toggled away from)
-    // After toggle, red_sel points to NEW buffer; old buffer is (1 - red_sel)
-    const used_dsd = if (red_sel == 0)
-        @get_dsd(mem1d_dsd, .{ .base_address = &red_in_1, .extent = dM })
-    else
-        @get_dsd(mem1d_dsd, .{ .base_address = &red_in_0, .extent = dM });
-    @fmovs(used_dsd, zeros_dsd, .{});
+    @fmovs(red_in_dsd, zeros_dsd, .{});
 
     reduce_col += 1;
     if (reduce_col == @as(i16, kernel_y_dim) * dN_y) {
@@ -296,7 +267,6 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(gemv_task, gemv_task_id);
-    @bind_local_task(reduce_done_task, reduce_done_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
