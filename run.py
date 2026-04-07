@@ -203,7 +203,7 @@ print(f"  Max:  {cycles.max()}")
 print(f"  Mean: {cycles.mean():.1f}")
 
 # Profile breakdown (averages across all PEs)
-total_cols = (N // kernel_y_dim) * kernel_y_dim  # total_columns
+total_cols = N  # total_columns = kernel_y_dim * dN_y = kernel_y_dim * (N/kernel_y_dim) = N
 print(f"\nProfile breakdown (mean across PEs, {total_cols} columns):")
 print(f"  GEMV total:    {gemv_tot.mean():.0f} cy  ({gemv_tot.mean()/max(total_cols,1):.1f} cy/col)")
 print(f"  Reduce total:  {reduce_tot.mean():.0f} cy  ({reduce_tot.mean()/max(total_cols,1):.1f} cy/col)")
