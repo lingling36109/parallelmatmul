@@ -141,7 +141,7 @@ task relay_task(in_data: f32) void {
 task send_b_task() void {
     has_sent = true;
     send_col = 0;
-    end_next_column();
+    send_next_column();
 }
 
 fn send_next_column() void {
