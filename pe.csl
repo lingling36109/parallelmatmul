@@ -81,7 +81,7 @@ task recv_b_task(wavelet: f32) void {
         );
         @fmovs(c_dsd, red_dsd, .{});
 
-        if (layout_mod.get_x_coord() == kernel_x_dim - 1) {
+        if (layout_mod.get_x_coord() == @as(u16, kernel_x_dim - 1)) {
             // Rightmost PE: send partial on reduce synchronously, then clean up
             const out_red = @get_dsd(fabout_dsd, .{
                 .fabric_color = reduce_color,
