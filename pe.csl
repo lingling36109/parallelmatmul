@@ -52,9 +52,16 @@ const flyover_oq: output_queue = @get_output_queue(4);
 const flyover_iq: input_queue = @get_input_queue(4);
 
 // =============================================================================
-// Storage
+// Storage (reordered for SRAM bank-conflict avoidance)
 // =============================================================================
+// Place red_in immediately before A with padding to force different bank alignment.
+// WSE-2 uses word-interleaved banking: bank = (word_addr % N_banks).
+// If dM is divisible by N_banks, red_in and every A column land in the same bank
+// → reads serialize → 2 cy/element. Padding shifts A to a different bank → 1 cy/element.
+var red_in: [dM]f32 = @zeros([dM]f32);
+var _pad_bank: [1]f32 = @zeros([1]f32); // bank-alignment padding (try 1,2,3,5,7)
 var A: [dM * dH]f32 = @zeros([dM * dH]f32);
+var work_B: [dH]f32 = @zeros([dH]f32);
 var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
 
@@ -62,14 +69,11 @@ var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-var red_in: [dM]f32 = @zeros([dM]f32);
-
 // Batch receive buffer — holds dN_y columns (one sending PE's worth)
 var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
 const batch_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dN_y * dH });
 
-// Work buffer — GEMV reads from here (fixed base, comptime offsets)
-var work_B: [dH]f32 = @zeros([dH]f32);
+// Work buffer DSD (work_B declared above near A for locality)
 const work_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &work_B, .extent = dH });
 
 // =============================================================================
@@ -86,6 +90,20 @@ const fabin_batch = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_rx_color,
     .extent = dN_y * dH,
     .input_queue = broadcast_iq,
+});
+
+// Pre-computed fabric DSDs for reduce (constant across all calls)
+const fabin_reduce = @get_dsd(fabin_dsd, .{
+    .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
+});
+const fabin_flyover = @get_dsd(fabin_dsd, .{
+    .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
+});
+const fabout_reduce = @get_dsd(fabout_dsd, .{
+    .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
+});
+const fabout_flyover = @get_dsd(fabout_dsd, .{
+    .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
 });
 
 // =============================================================================
@@ -136,8 +154,16 @@ task batch_done_task() void {
             }
         }
 
-        // GEMV: red_in += A * work_B — inner loop unrolls (comptime dH)
-        var h: i16 = 0;
+        // GEMV: h=0 overwrites red_in (eliminates separate clear)
+        {
+            const a_col_0 = @increment_dsd_offset(
+                @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
+                0, f32
+            );
+            @fmacs(red_in_dsd, zeros_dsd, a_col_0, work_B[0]);
+        }
+        // h=1..dH-1: accumulate
+        var h: i16 = 1;
         while (h < dH) {
             const a_col = @increment_dsd_offset(
                 @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
@@ -229,19 +255,6 @@ fn reduce() void {
     var c_col_dsd = C_dsd;
     c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
 
-    const fabin_reduce = @get_dsd(fabin_dsd, .{
-        .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
-    });
-    const fabin_flyover = @get_dsd(fabin_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
-    });
-    const fabout_reduce = @get_dsd(fabout_dsd, .{
-        .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
-    });
-    const fabout_flyover = @get_dsd(fabout_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
-    });
-
     if (kernel_x_dim == 1) {
         @fmovs(c_col_dsd, red_in_dsd, .{});
         fsum_count += 1;
@@ -268,7 +281,7 @@ fn reduce() void {
         }
     }
 
-    @fmovs(red_in_dsd, zeros_dsd, .{});
+    // red_in clear removed — first GEMV iteration overwrites via zeros_dsd
 
     reduce_col += 1;
     if (reduce_col == total_columns) {
