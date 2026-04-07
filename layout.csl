@@ -14,60 +14,60 @@ const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
 const broadcast_color: color = @get_color(0);
-const reduce_color: color = @get_color(5);
+const reduce_color: color    = @get_color(1);
 
 const memcpy = @import_module("<memcpy/get_params>", .{
-    .width = kernel_x_dim,
-    .height = kernel_y_dim,
-    .MEMCPYH2D_1 = MEMCPYH2D_DATA_1,
-    .MEMCPYH2D_2 = MEMCPYH2D_DATA_2,
-    .MEMCPYD2H_1 = MEMCPYD2H_DATA_1
+  .width = kernel_x_dim,
+  .height = kernel_y_dim,
+  .MEMCPYH2D_1 = MEMCPYH2D_DATA_1,
+  .MEMCPYH2D_2 = MEMCPYH2D_DATA_2,
+  .MEMCPYD2H_1 = MEMCPYD2H_DATA_1
 });
 
 layout {
-    @set_rectangle(kernel_x_dim, kernel_y_dim);
+  @set_rectangle(kernel_x_dim, kernel_y_dim);
 
-    const common_params = .{
-        .dM = M / kernel_y_dim,
-        .dN = N / kernel_x_dim,
-        .dN_y = N / kernel_y_dim,
-        .dH = H / kernel_x_dim,
-        .kernel_x_dim = kernel_x_dim,
-        .kernel_y_dim = kernel_y_dim,
-        .broadcast_color = broadcast_color,
-        .reduce_color = reduce_color,
-    };
+  const common_params = .{
+    .dM = M / kernel_y_dim,
+    .dN = N / kernel_x_dim,
+    .dN_y = N / kernel_y_dim,
+    .dH = H / kernel_x_dim,
+    .kernel_x_dim = kernel_x_dim,
+    .kernel_y_dim = kernel_y_dim,
+    .broadcast_color = broadcast_color,
+    .reduce_color = reduce_color,
+  };
 
-    for (@range(i16, kernel_x_dim)) |pe_x| {
-        for (@range(i16, kernel_y_dim)) |pe_y| {
-            @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
-                common_params,
-                .{ .memcpy_params = memcpy.get_params(pe_x) }
-            ));
+  for (@range(i16, kernel_x_dim)) |pe_x| {
+    for (@range(i16, kernel_y_dim)) |pe_y| {
+      @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+        common_params,
+        .{ .memcpy_params = memcpy.get_params(pe_x) }
+      ));
 
-            // Broadcast: North -> South (B-block distribution)
-            if (pe_y == 0) {
-                @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} } });
-            } else if (pe_y == kernel_y_dim - 1) {
-                @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
-            } else {
-                @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } });
-            }
+      // Broadcast: North -> South
+      const b_routes = if (pe_y == 0)
+        .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} }
+      else if (pe_y == kernel_y_dim - 1)
+        .{ .rx = .{NORTH}, .tx = .{RAMP} }
+      else
+        .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} };
+      @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = b_routes });
 
-            // Reduction: East -> West (C-block accumulation)
-            if (pe_x == kernel_x_dim - 1) {
-                @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
-            } else if (pe_x == 0) {
-                @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
-            } else {
-                @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} } });
-            }
-        }
+      // Reduction: East -> West
+      const r_routes = if (pe_x == kernel_x_dim - 1)
+        .{ .rx = .{RAMP}, .tx = .{WEST} }
+      else if (pe_x == 0)
+        .{ .rx = .{EAST}, .tx = .{RAMP} }
+      else
+        .{ .rx = .{EAST}, .tx = .{WEST, RAMP} };
+      @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = r_routes });
     }
+  }
 
-    @export_name("A", [*]f32, true);
-    @export_name("B", [*]f32, true);
-    @export_name("C", [*]f32, true);
-    @export_name("time_buf_u16", [*]u16, true);
-    @export_name("broadcast_pe", fn () void);
+  @export_name("A", [*]f32, true);
+  @export_name("B", [*]f32, true);
+  @export_name("C", [*]f32, true);
+  @export_name("time_buf_u16", [*]u16, true);
+  @export_name("broadcast_pe", fn () void);
 }
