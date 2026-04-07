@@ -134,9 +134,9 @@ task do_reduce() void {
     var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq });
     var in_dsd = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq });
 
-    if (pe_x == isum_pe) {
+    if (@as(u16, pe_x) == isum_pe) {
         @fmovs(out_dsd, completed_red_dsd, .{ .async = true });
-    } else if (pe_x == fsum_pe) {
+    } else if (@as(u16, pe_x) == fsum_pe) {
         const my_c_col = k / kernel_x_dim;
         var c_dest_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C[my_c_col * dM], .extent = dM });
         @fadds(c_dest_dsd, in_dsd, completed_red_dsd, .{ .async = true });
