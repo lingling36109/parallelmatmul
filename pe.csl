@@ -8,14 +8,15 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
-var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
-
+// Buffers for host access
 var A: [dM * dH]f32;
 var B: [dH * dN_y]f32;
 var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
+
+var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
+var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 const send_task_id: local_task_id = @get_local_task_id(11);
 const recv_task_id: data_task_id = @get_data_task_id(broadcast_color);
@@ -26,18 +27,18 @@ var h_idx: i16 = 0;
 var n_idx: i16 = 0;
 var reduce_cnt: i16 = 0;
 
-// SENDER: Injecting B columns into the fabric
+// SENDER: Column-wise B broadcast
 task send_b_task() void {
     if (send_col >= dN_y) return;
     const out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .output_queue = @get_output_queue(2) });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // REMOVED .async to fix SimException (instruction slot competition)
+    // Synchronous move to prevent SimException/slot-overflow
     @fmovs(out_dsd, b_ptr, .{ .activate = send_task_id });
     send_col += 1;
 }
 
-// COMPUTE: Triggers on every element of B arriving from the broadcast
+// COMPUTE: Triggers for every element arriving from the broadcast
 task recv_b_task(wavelet: f32) void {
     const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
     const a_col_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }), h_idx * dM, f32);
@@ -47,22 +48,21 @@ task recv_b_task(wavelet: f32) void {
     h_idx += 1;
     if (h_idx == dH) {
         h_idx = 0;
-        // Partial sum complete, trigger reduction Westward
+        // Inject local result into the Westward reduction chain
         const out_red = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_color, .extent = dM, .output_queue = @get_output_queue(3) });
         @fmovs(out_red, red_dsd, .{ .async = true });
     }
 }
 
-// REDUCTION: Accumulate partial sums from the East
+// REDUCE: Accumulate partial results from the East
 task reduce_task(val: f32) void {
-    const my_x = layout_mod.get_x_coord();
     C[n_idx * dM + reduce_cnt] += val;
 
     reduce_cnt += 1;
     if (reduce_cnt == dM) {
         reduce_cnt = 0;
         n_idx += 1;
-        // Reset local accumulator for the next B column
+        // Reset partial sum buffer
         @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }), @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
         if (n_idx == dN_y) {
@@ -75,7 +75,6 @@ task reduce_task(val: f32) void {
 fn broadcast_pe() void {
     timestamp.enable_tsc();
     timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[0]));
-
     if (layout_mod.get_y_coord() == 0) {
         @activate(send_task_id);
     }
@@ -86,9 +85,10 @@ comptime {
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
 
-    @export_symbol(&A, "A");
-    @export_symbol(&B, "B");
-    @export_symbol(&C, "C");
+    // FIX: Removed '&' to export the global symbol correctly
+    @export_symbol(A, "A");
+    @export_symbol(B, "B");
+    @export_symbol(C, "C");
     @export_symbol(ptr_time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
