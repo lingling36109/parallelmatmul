@@ -14,6 +14,7 @@ const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
 const broadcast_color: color = @get_color(0);
+const reduce_color: color = @get_color(5); // For horizontal sum
 
 const memcpy = @import_module("<memcpy/get_params>", .{
     .width = kernel_x_dim,
@@ -34,6 +35,7 @@ layout {
         .kernel_x_dim = kernel_x_dim,
         .kernel_y_dim = kernel_y_dim,
         .broadcast_color = broadcast_color,
+        .reduce_color = reduce_color,
     };
 
     for (@range(i16, kernel_x_dim)) |pe_x| {
@@ -43,13 +45,22 @@ layout {
                 .{ .memcpy_params = memcpy.get_params(pe_x) }
             ));
 
-            // Hardware-level broadcast routing
+            // Hardware Broadcast (North -> South)
             if (pe_y == 0) {
                 @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} } });
             } else if (pe_y == kernel_y_dim - 1) {
                 @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
             } else {
                 @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } });
+            }
+
+            // Reduction Routing (East -> West)
+            if (pe_x == kernel_x_dim - 1) {
+                @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+            } else if (pe_x == 0) {
+                @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+            } else {
+                @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} } });
             }
         }
     }
