@@ -88,10 +88,11 @@ const recv_task_id: data_task_id = @get_data_task_id(broadcast_rx_color);
 const relay_task_id: data_task_id = @get_data_task_id(broadcast_tx_color);
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
-const gemv_task_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// Broadcast Receive Task — store only (~1 cycle per wavelet)
+// Broadcast Receive Task — store-then-compute
+//   Wavelets 0..dH-2: just store to buf_B (~1 cycle, fast pipeline)
+//   Wavelet dH-1: batched GEMV + synchronous reduce (flow control)
 // =============================================================================
 task recv_broadcast_task(in_data: f32) void {
     buf_B[h_idx] = in_data;
@@ -100,7 +101,20 @@ task recv_broadcast_task(in_data: f32) void {
 
     if (h_idx == dH) {
         h_idx = 0;
-        @activate(gemv_task_id);
+
+        // Batched GEMV: red_in += A * buf_B
+        // Unrolled by --max-inlined-iterations 150
+        var h: i16 = 0;
+        while (h < dH) {
+            const a_col = @increment_dsd_offset(
+                @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
+                h * dM, f32
+            );
+            @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B[h]);
+            h += 1;
+        }
+
+        reduce();
     }
 
     if (!has_sent) {
@@ -110,24 +124,6 @@ task recv_broadcast_task(in_data: f32) void {
             @activate(send_task_id);
         }
     }
-}
-
-// =============================================================================
-// GEMV Task — batched compute after full B column received, then sync reduce
-// =============================================================================
-task gemv_task() void {
-    // Batched GEMV: red_in += A * buf_B (unrolled by --max-inlined-iterations 150)
-    var h: i16 = 0;
-    while (h < dH) {
-        const a_col = @increment_dsd_offset(
-            @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
-            h * dM, f32
-        );
-        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B[h]);
-        h += 1;
-    }
-
-    reduce();
 }
 
 // =============================================================================
@@ -266,7 +262,6 @@ comptime {
 
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
-    @bind_local_task(gemv_task, gemv_task_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
