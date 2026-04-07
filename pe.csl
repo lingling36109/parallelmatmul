@@ -157,19 +157,21 @@ fn terminate_kernel() void {
 }
 
 comptime {
-  @comptime_assert(@is_arch("wse2"));
-  
-  @bind_local_task(send_b_task, send_task_id);
-  @bind_local_task(do_reduce, reduce_task_id);
-  
-  @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_rx_color));
+    @comptime_assert(@is_arch("wse2"));
+
+  @bind_local_task(send_b_task, send_task_id); [cite: 39]
+  @bind_local_task(do_reduce, reduce_task_id); [cite: 39]
+
+  // Use an if/else to ensure only one binding per PE
   if (pe_y == 0) {
       @bind_data_task(color_swap_task, @get_data_task_id(broadcast_rx_color));
+  } else {
+      @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_rx_color));
   }
 
-  @export_symbol(ptr_A, "A");
-  @export_symbol(ptr_B, "B");
-  @export_symbol(ptr_C, "C");
-  @export_symbol(ptr_time_buf_u16, "time_buf_u16");
-  @export_symbol(broadcast_pe);
+  @export_symbol(ptr_A, "A"); [cite: 40]
+  @export_symbol(ptr_B, "B"); [cite: 40]
+  @export_symbol(ptr_C, "C"); [cite: 40]
+  @export_symbol(ptr_time_buf_u16, "time_buf_u16"); [cite: 40]
+  @export_symbol(broadcast_pe); [cite: 40]
 }
