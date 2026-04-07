@@ -1,25 +1,46 @@
+// Color map
+//
+//  ID var                   ID var  ID var               ID var
+//   0 broadcast_rx_color    9       18                   27 reserved (memcpy)
+//   1 broadcast_tx_color    10      19                   28 reserved (memcpy)
+//   2 MEMCPYH2D_1           11      20                   29 reserved
+//   3 MEMCPYH2D_2           12      21 reserved (memcpy) 30 reserved (memcpy)
+//   4 MEMCPYD2H_1           13      22 reserved (memcpy) 31 reserved
+//   5 reduce_A_color        14      23 reserved (memcpy) 32
+//   6 reduce_B_color        15      24                   33
+//   7 reduce_C_color        16      25                   34
+//   8                       17      26                   35
+
+
+// IDs for memcpy streaming colors
 param MEMCPYH2D_DATA_1_ID: i16;
 param MEMCPYH2D_DATA_2_ID: i16;
 param MEMCPYD2H_DATA_1_ID: i16;
 
+// Colors
 const MEMCPYH2D_DATA_1: color = @get_color(MEMCPYH2D_DATA_1_ID);
 const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
+// Kernel dimensions
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
 
+// Total matrix dimensions
 param M: i16;
 param H: i16;
 param N: i16;
 
+// Colors
 const broadcast_rx_color: color = @get_color(0);
 const broadcast_tx_color: color = @get_color(1);
 
+// Reduction colors: three colors needed for the interleaved ring reduction
 const reduce_A_color: color = @get_color(5);
 const reduce_B_color: color = @get_color(6);
 const reduce_C_color: color = @get_color(7);
 
+// Memcpy infrastructure (provided)
 const memcpy = @import_module("<memcpy/get_params>", .{
   .width = kernel_x_dim,
   .height = kernel_y_dim,
@@ -29,26 +50,27 @@ const memcpy = @import_module("<memcpy/get_params>", .{
 });
 
 layout {
+  // PE coordinates are (column, row)
   @set_rectangle(kernel_x_dim, kernel_y_dim);
 
-  // --- Broadcast Routes ---
-  const BCAST_RX_HEAD = .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } };
-  const BCAST_TX_HEAD = .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} } };
+  // PE rectangle dimensions should evenly divide matrix dimensions
+  @comptime_assert(M % kernel_y_dim == 0);
+  @comptime_assert(H % kernel_x_dim == 0);
+  @comptime_assert(N % kernel_y_dim == 0);
+  @comptime_assert(N % kernel_x_dim == 0);
+  @comptime_assert(kernel_x_dim >= 2);
+  @comptime_assert(kernel_y_dim >= 2);
 
-  const BCAST_RX_MID  = .{ .routes = .{ .rx = .{RAMP, SOUTH}, .tx = .{NORTH} } };
-  const BCAST_TX_MID  = .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } };
-
-  const BCAST_RX_TAIL = .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } };
-  const BCAST_TX_TAIL = .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } };
-
-  // --- Ring Reduction Routes ---
-  const RED_TX_E = .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } };
-  const RED_RX_W = .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } };
-  const RED_TX_W = .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } };
-  const RED_RX_E = .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } };
-  const RED_PASS = .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST} } };
-
-  // --- Tile Config Parameters ---
+  // The tensor mapping is fixed for this homework, so we can precompute the parameters for each PE
+  //  and pass them in via the tile code. This struct will be concatenated with the memcpy parameters. 
+  // e.g.:
+  //     @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+  //       common_params,
+  //       .{.memcpy_params = memcpy.get_params(pe_x),
+  //         .reduce_tx_color = reduce_tx_color,
+  //         .reduce_rx_color = reduce_rx_color,
+  //       },
+  //     ));
   const common_params = .{
     .dM = M / kernel_y_dim,
     .dN = N / kernel_x_dim,
@@ -60,71 +82,137 @@ layout {
     .broadcast_rx_color = broadcast_rx_color,
   };
 
-  const params_0         = @concat_structs(common_params, .{ .reduce_tx_color = reduce_A_color, .reduce_rx_color = reduce_C_color });
-  const params_odd       = @concat_structs(common_params, .{ .reduce_tx_color = reduce_B_color, .reduce_rx_color = reduce_A_color });
-  const params_even      = @concat_structs(common_params, .{ .reduce_tx_color = reduce_A_color, .reduce_rx_color = reduce_B_color });
-  const params_last_odd  = @concat_structs(common_params, .{ .reduce_tx_color = reduce_C_color, .reduce_rx_color = reduce_A_color });
-  const params_last_even = @concat_structs(common_params, .{ .reduce_tx_color = reduce_C_color, .reduce_rx_color = reduce_B_color });
+  // ===========================================================================
+  // TODO: Implement tile code assignment and fabric routing.
+  //
+  // For each PE(pe_x, pe_y) you must:
+  //
+  //  1) Configure broadcast routes using @set_color_config.
+  //     Broadcasting sends B-column data from each PE in turn down the
+  //     Y-column. Use color swap or an additional PE to change the color.
+  //     Hint: if you need to send SWITCH_ADV signals on the same color, 
+  //     also RAMP needs swap_x and swap_y to be enabled.
+  //
+  //  2) Upon receiving a broadcast wavelet, a PE should trigger a SAXPY operation
+  //     to update its partial C column.
+  //
+  //  2) Configure reduction ring routes using @set_color_config. Remember that colors
+  //     need to be alternated.
+  //     Each PE needs 3 colors:
+  //       reduce_tx_color: RAMP -> fabric (the PE's own send)
+  //       reduce_rx_color: fabric -> RAMP (the PE's own receive)
+  //       flyover color: passthrough for the other ring traffic
+  //
+  // Useful API:
+  //   @set_tile_code(pe_x, pe_y, "pe.csl", params_struct)
+  //   @set_color_config(pe_x, pe_y, color, .{ .routes = .{...}, .switches = .{...} })
+  //   @concat_structs(struct1, struct2)
+  //   memcpy.get_params(pe_x)
+  //   Directions: NORTH, SOUTH, EAST, WEST, RAMP
+  // ===========================================================================
+  //
+
+  // Reduction: 2-color checkerboard EAST chain + 1 scatter color WEST
+  // reduce_A_color / reduce_B_color: checkerboard for EAST accumulation
+  // reduce_C_color: scatter result WEST from PE(kx-1) to FSUM PE
 
   for (@range(i16, kernel_x_dim)) |pe_x| {
     for (@range(i16, kernel_y_dim)) |pe_y| {
 
-      // 1. Assign Pre-Computed Tile Codes
-      if (pe_x == 0) {
-          @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_0));
-      } else if (pe_x == kernel_x_dim - 1) {
-          if (pe_x % 2 == 1) {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_last_odd));
-          } else {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_last_even));
-          }
+      // --- Set tile code with checkerboard reduce colors ---
+      if (pe_x % 2 == 0) {
+        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+          common_params,
+          .{
+            .memcpy_params = memcpy.get_params(pe_x),
+            .reduce_tx_color = reduce_A_color,
+            .reduce_rx_color = reduce_B_color,
+            .scatter_color = reduce_C_color,
+          },
+        ));
       } else {
-          if (pe_x % 2 == 1) {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_odd));
-          } else {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_even));
-          }
+        @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+          common_params,
+          .{
+            .memcpy_params = memcpy.get_params(pe_x),
+            .reduce_tx_color = reduce_B_color,
+            .reduce_rx_color = reduce_A_color,
+            .scatter_color = reduce_C_color,
+          },
+        ));
       }
 
-      // 2. Broadcast Colors
+      // --- Broadcast routing ---
+      // broadcast_tx_color: PEs y>0 send B data NORTH to PE(x,0)
+      // broadcast_rx_color: PE(x,0) relays data SOUTH to all PEs (software relay)
+
       if (pe_y == 0) {
-          @set_color_config(pe_x, pe_y, broadcast_rx_color, BCAST_RX_HEAD);
-          @set_color_config(pe_x, pe_y, broadcast_tx_color, BCAST_TX_HEAD);
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+            .routes = .{ .rx = .{SOUTH}, .color_swap_y = true },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+            .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP}, .color_swap_y = true },
+        });
       } else if (pe_y == kernel_y_dim - 1) {
-          @set_color_config(pe_x, pe_y, broadcast_rx_color, BCAST_RX_TAIL);
-          @set_color_config(pe_x, pe_y, broadcast_tx_color, BCAST_TX_TAIL);
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} },
+        });
       } else {
-          @set_color_config(pe_x, pe_y, broadcast_rx_color, BCAST_RX_MID);
-          @set_color_config(pe_x, pe_y, broadcast_tx_color, BCAST_TX_MID);
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} }, 
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
+        });
       }
 
-      // 3. Ring Reduction Colors
-      if (pe_x == 0) {
-          @set_color_config(pe_x, pe_y, reduce_A_color, RED_TX_E);
-          @set_color_config(pe_x, pe_y, reduce_C_color, RED_RX_E);
-      } else if (pe_x == kernel_x_dim - 1) {
-          if (pe_x % 2 == 1) {
-              @set_color_config(pe_x, pe_y, reduce_A_color, RED_RX_W);
-          } else {
-              @set_color_config(pe_x, pe_y, reduce_B_color, RED_RX_W);
-          }
-          @set_color_config(pe_x, pe_y, reduce_C_color, RED_TX_W);
+      // --- Reduction EAST chain routing (checkerboard) ---
+      // Even PEs: send on reduce_A (RAMP->EAST), recv on reduce_B (WEST->RAMP)
+      // Odd PEs:  send on reduce_B (RAMP->EAST), recv on reduce_A (WEST->RAMP)
+      if (pe_x % 2 == 0) {
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
+        });
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{
+          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
+        });
       } else {
-          if (pe_x % 2 == 1) {
-              @set_color_config(pe_x, pe_y, reduce_A_color, RED_RX_W);
-              @set_color_config(pe_x, pe_y, reduce_B_color, RED_TX_E);
-          } else {
-              @set_color_config(pe_x, pe_y, reduce_B_color, RED_RX_W);
-              @set_color_config(pe_x, pe_y, reduce_A_color, RED_TX_E);
-          }
-          @set_color_config(pe_x, pe_y, reduce_C_color, RED_PASS);
+        @set_color_config(pe_x, pe_y, reduce_B_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{EAST} },
+        });
+        @set_color_config(pe_x, pe_y, reduce_A_color, .{
+          .routes = .{ .rx = .{WEST}, .tx = .{RAMP} },
+        });
+      }
+
+      // --- Scatter WEST routing (reduce_C_color) ---
+      // PE(kx-1): RAMP->WEST (injects result)
+      // PE(0): EAST->RAMP (terminal)
+      // Middle: EAST->WEST+RAMP (forward and deliver)
+      if (pe_x == kernel_x_dim - 1) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{RAMP}, .tx = .{WEST} },
+        });
+      } else if (pe_x == 0) {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{EAST}, .tx = .{RAMP} },
+        });
+      } else {
+        @set_color_config(pe_x, pe_y, reduce_C_color, .{
+          .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} },
+        });
       }
     }
   }
 
+  // Export symbol names
   @export_name("A", [*]f32, true);
   @export_name("B", [*]f32, true);
   @export_name("C", [*]f32, true);
   @export_name("time_buf_u16", [*]u16, true);
   @export_name("broadcast_pe", fn () void);
 }
+
