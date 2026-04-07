@@ -68,11 +68,9 @@ var buf_B_1: [dH]f32 = @zeros([dH]f32);
 const buf_B_0_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B_0, .extent = dH });
 const buf_B_1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B_1, .extent = dH });
 
-// Double-buffered reduction accumulators
-var red_in_0: [dM]f32 = @zeros([dM]f32);
-var red_in_1: [dM]f32 = @zeros([dM]f32);
-const red_in_0_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in_0, .extent = dM });
-const red_in_1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in_1, .extent = dM });
+// Single reduction accumulator (reduce is synchronous, no double-buffer needed)
+var red_in: [dM]f32 = @zeros([dM]f32);
+const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
 
 // =============================================================================
 // DSDs
@@ -100,9 +98,8 @@ var col_count: i16 = 0;
 var has_sent: bool = false;
 var send_col: i16 = 0;
 
-// Double-buffer selector and reduce tracking
+// Double-buffer selector for buf_B
 var buf_sel: i16 = 0;
-var reduce_clear_sel: i16 = 0;
 
 // Pre-computed values (set in broadcast_pe)
 var my_x_val: i16 = 0;
@@ -116,7 +113,6 @@ const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
 const column_done_id: local_task_id = @get_local_task_id(13);
-const reduce_done_id: local_task_id = @get_local_task_id(14);
 
 // =============================================================================
 // DSD Streaming Receive — target alternate buf_B
@@ -136,7 +132,7 @@ fn gemv_0() void {
     var h: i16 = 0;
     while (h < dH) {
         const a_col = @increment_dsd_offset(A_base_dsd, h * dM, f32);
-        @fmacs(red_in_0_dsd, red_in_0_dsd, a_col, buf_B_0[h]);
+        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B_0[h]);
         h += 1;
     }
 }
@@ -145,13 +141,13 @@ fn gemv_1() void {
     var h: i16 = 0;
     while (h < dH) {
         const a_col = @increment_dsd_offset(A_base_dsd, h * dM, f32);
-        @fmacs(red_in_1_dsd, red_in_1_dsd, a_col, buf_B_1[h]);
+        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B_1[h]);
         h += 1;
     }
 }
 
 // =============================================================================
-// Column Done Task — GEMV + overlap receive + async reduce
+// Column Done Task — GEMV, then overlap receive with synchronous reduce
 // =============================================================================
 task column_done_task() void {
     col_count += 1;
@@ -162,23 +158,26 @@ task column_done_task() void {
         }
     }
 
-    // GEMV: accumulate into red_in[buf_sel] using buf_B[buf_sel]
+    // GEMV: accumulate into red_in using buf_B[buf_sel]
     if (buf_sel == 0) {
         gemv_0();
     } else {
         gemv_1();
     }
 
-    const reduce_sel = buf_sel;
+    // Toggle buffer for next column
     buf_sel = 1 - buf_sel;
 
-    // Arm next receive into OTHER buf_B BEFORE reduce (key overlap!)
+    // Arm next receive into OTHER buf_B BEFORE reduce.
+    // This keeps fabin_broadcast active during reduce, preventing backpressure.
+    // Receive runs on broadcast_iq (queue 3) microthread, concurrent with
+    // the synchronous reduce which blocks the main thread.
     if (col_count < total_columns) {
         receive_next_column();
     }
 
-    // Async reduce on the red_in we just filled
-    async_reduce(reduce_sel);
+    // Synchronous reduce — no microthread slot conflicts
+    reduce();
 }
 
 // =============================================================================
@@ -240,9 +239,9 @@ task send_done_task() void {
 }
 
 // =============================================================================
-// Async Rotating Ring Reduction
+// Synchronous Rotating Ring Reduction
 // =============================================================================
-fn async_reduce(red_sel: i16) void {
+fn reduce() void {
     const my_x = my_x_val;
 
     const fsum_pe = reduce_col / dN;
@@ -250,9 +249,6 @@ fn async_reduce(red_sel: i16) void {
 
     var c_col_dsd = C_dsd;
     c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
-
-    const red_dsd = if (red_sel == 0) red_in_0_dsd else red_in_1_dsd;
-    reduce_clear_sel = red_sel;
 
     const fabin_reduce = @get_dsd(fabin_dsd, .{
         .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
@@ -268,44 +264,34 @@ fn async_reduce(red_sel: i16) void {
     });
 
     if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, red_dsd, .{ .async = true, .activate = reduce_done_id });
+        @fmovs(c_col_dsd, red_in_dsd, .{});
         fsum_count += 1;
     } else if (my_x == isum_pe) {
         if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, red_dsd, .{ .async = true, .activate = reduce_done_id });
+            @fmovs(fabout_flyover, red_in_dsd, .{});
         } else {
-            @fmovs(fabout_reduce, red_dsd, .{ .async = true, .activate = reduce_done_id });
+            @fmovs(fabout_reduce, red_in_dsd, .{});
         }
     } else if (my_x == fsum_pe) {
         if (my_x == 0) {
-            @fadds(c_col_dsd, red_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_id });
+            @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{});
         } else {
-            @fadds(c_col_dsd, red_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_id });
+            @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{});
         }
         fsum_count += 1;
     } else {
         if (my_x == 0) {
-            @fadds(fabout_reduce, red_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_id });
+            @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{});
         } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, red_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_id });
+            @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{});
         } else {
-            @fadds(fabout_reduce, red_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_id });
+            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{});
         }
     }
 
+    @fmovs(red_in_dsd, zeros_dsd, .{});
+
     reduce_col += 1;
-}
-
-// =============================================================================
-// Reduce Done Task — clear buffer and check termination
-// =============================================================================
-task reduce_done_task() void {
-    if (reduce_clear_sel == 0) {
-        @fmovs(red_in_0_dsd, zeros_dsd, .{});
-    } else {
-        @fmovs(red_in_1_dsd, zeros_dsd, .{});
-    }
-
     if (reduce_col == total_columns) {
         terminate_kernel();
     }
@@ -340,7 +326,6 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(column_done_task, column_done_id);
-    @bind_local_task(reduce_done_task, reduce_done_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
