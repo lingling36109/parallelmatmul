@@ -116,8 +116,8 @@ task recv_broadcast_task(in_data: f32) void {
             current_row = 0;
         }
 
-        if (current_row == layout_mod.get_y_coord() and cols_sent < dN_y) {
-            @activate(send_task_id);
+        if (@as(u16, current_row) == layout_mod.get_y_coord() and cols_sent < dN_y) {
+            @activate(send_b_task_id);
         }
     }
 }
