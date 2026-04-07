@@ -19,7 +19,7 @@ const timestamp = @import_module("<time>");
 // TSC timer buffers
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
-var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
+var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2 + 12]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 fn start_timer() void {
@@ -98,6 +98,14 @@ var has_sent: bool = false;
 var send_col: i16 = 0;
 var batch_count: i16 = 0;
 
+// Profile instrumentation (single-column snapshot)
+var profTsc0 = @zeros([timestamp.tsc_size_words]u16);
+var profTsc1 = @zeros([timestamp.tsc_size_words]u16);
+var profTsc2 = @zeros([timestamp.tsc_size_words]u16);
+var profTsc3 = @zeros([timestamp.tsc_size_words]u16);
+var profiled: bool = false;
+const profile_col: i16 = total_columns / 2;
+
 // Pre-computed values (set in broadcast_pe)
 var my_x_val: i16 = 0;
 var my_y_val: u16 = 0;
@@ -123,6 +131,14 @@ task batch_done_task() void {
         // Copy column from batch_B to work_B (sync, preserves comptime GEMV indexing)
         var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
         src = @increment_dsd_offset(src, col * dH, f32);
+
+        // Profile T0: before copy
+        if (!profiled) {
+            if (col_count == profile_col - 1) {
+                timestamp.get_timestamp(&profTsc0);
+            }
+        }
+
         @fmovs(work_B_dsd, src, .{});
 
         col_count += 1;
@@ -131,6 +147,13 @@ task batch_done_task() void {
         if (!has_sent) {
             if (col_count >= my_send_start_col) {
                 @activate(send_task_id);
+            }
+        }
+
+        // Profile T1: before GEMV
+        if (!profiled) {
+            if (col_count == profile_col) {
+                timestamp.get_timestamp(&profTsc1);
             }
         }
 
@@ -145,8 +168,35 @@ task batch_done_task() void {
             h += 1;
         }
 
+        // Profile T2: after GEMV, before reduce
+        if (!profiled) {
+            if (col_count == profile_col) {
+                timestamp.get_timestamp(&profTsc2);
+            }
+        }
+
         // Synchronous reduce
         reduce();
+
+        // Profile T3: after reduce
+        if (!profiled) {
+            if (col_count == profile_col) {
+                timestamp.get_timestamp(&profTsc3);
+                profiled = true;
+                time_buf_u16[6] = profTsc0[0];
+                time_buf_u16[7] = profTsc0[1];
+                time_buf_u16[8] = profTsc0[2];
+                time_buf_u16[9] = profTsc1[0];
+                time_buf_u16[10] = profTsc1[1];
+                time_buf_u16[11] = profTsc1[2];
+                time_buf_u16[12] = profTsc2[0];
+                time_buf_u16[13] = profTsc2[1];
+                time_buf_u16[14] = profTsc2[2];
+                time_buf_u16[15] = profTsc3[0];
+                time_buf_u16[16] = profTsc3[1];
+                time_buf_u16[17] = profTsc3[2];
+            }
+        }
 
         col += 1;
     }
