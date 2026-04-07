@@ -15,7 +15,7 @@ const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
 const broadcast_color: color = @get_color(0);
 const reduce_color: color    = @get_color(1);
-const sync_color: color      = @get_color(2);
+const sync_color: color      = @get_color(5);
 
 const memcpy = @import_module("<memcpy/get_params>", .{
     .width = kernel_x_dim,
@@ -30,15 +30,15 @@ layout {
 
     const common_params = .{
         .dM = M / kernel_y_dim,
-        .dH = H,
         .dN = N / kernel_x_dim,
-        .dN_y = N / kernel_x_dim,
+        .dN_y = N / kernel_y_dim,
+        .dH = H / kernel_x_dim,
         .kernel_x_dim = kernel_x_dim,
         .kernel_y_dim = kernel_y_dim,
     };
 
-    for (let pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x += 1) {
-        for (let pe_y: i16 = 0; pe_y < kernel_y_dim; pe_y += 1) {
+    for (@range(i16, kernel_x_dim)) |pe_x| {
+        for (@range(i16, kernel_y_dim)) |pe_y| {
             @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
                 common_params,
                 .{
@@ -49,6 +49,7 @@ layout {
                 }
             ));
 
+            // Broadcast: y=0 originates from RAMP, sends SOUTH+RAMP
             const b_routes = if (pe_y == 0)
                 .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} }
             else if (pe_y == kernel_y_dim - 1)
@@ -57,6 +58,7 @@ layout {
                 .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} };
             @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = b_routes });
 
+            // Reduce: rightmost sends WEST, others absorb from EAST
             const r_routes = if (pe_x == kernel_x_dim - 1)
                 .{ .rx = .{RAMP}, .tx = .{WEST} }
             else if (pe_x == 0)
@@ -65,6 +67,7 @@ layout {
                 .{ .rx = .{EAST}, .tx = .{WEST, RAMP} };
             @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = r_routes });
 
+            // Sync: bottom originates, propagates NORTH to y=0
             const s_routes = if (pe_y == kernel_y_dim - 1)
                 .{ .rx = .{RAMP}, .tx = .{NORTH} }
             else if (pe_y == 0)
@@ -75,9 +78,9 @@ layout {
         }
     }
 
-    for (let pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x += 1) {
-        @set_color_config(pe_x, 0, MEMCPYH2D_DATA_1, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
-        @set_color_config(pe_x, 0, MEMCPYH2D_DATA_2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
-        @set_color_config(pe_x, 0, MEMCPYD2H_DATA_1, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
-    }
+    @export_name("A", [*]f32, true);
+    @export_name("B", [*]f32, true);
+    @export_name("C", [*]f32, true);
+    @export_name("time_buf_u16", [*]u16, true);
+    @export_name("broadcast_pe", fn () void);
 }
