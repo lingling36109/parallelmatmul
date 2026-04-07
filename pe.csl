@@ -64,9 +64,11 @@ var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
 
-// B-column receive buffer for DSD streaming
-var buf_B: [dH]f32 = @zeros([dH]f32);
-const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
+// Total columns to process
+const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
+
+// Large receive buffer — holds ALL B columns, keeps fabin active for entire computation
+var all_B: [total_columns * dH]f32 = @zeros([total_columns * dH]f32);
 
 // =============================================================================
 // DSDs
@@ -76,13 +78,6 @@ const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
-
-// DSD for streaming receive from broadcast fabric
-const fabin_broadcast = @get_dsd(fabin_dsd, .{
-    .fabric_color = broadcast_rx_color,
-    .extent = dH,
-    .input_queue = broadcast_iq,
-});
 
 // =============================================================================
 // State variables
@@ -98,27 +93,31 @@ var my_x_val: i16 = 0;
 var my_y_val: u16 = 0;
 var my_send_start_col: i16 = 0;
 
-// Total columns to process
-const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
-
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
 const column_done_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// DSD Streaming Receive — hardware-speed column reception
-// =============================================================================
-fn receive_next_column() void {
-    // Stream dH wavelets from fabric into buf_B at ~1 cycle/element
-    // No per-wavelet task overhead — pure hardware transfer
-    @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
-}
-
-// =============================================================================
-// Column Done Task — GEMV + reduce after full column received
+// Column Done Task — process columns from pre-filled all_B buffer
 // =============================================================================
 task column_done_task() void {
+    // First invocation: arm ONE big receive for ALL remaining columns.
+    // Runs continuously on broadcast_iq microthread — eliminates all backpressure.
+    if (col_count == 0) {
+        const remaining = @as(u16, (total_columns - 1) * dH);
+        if (remaining > 0) {
+            var rem_mem = @get_dsd(mem1d_dsd, .{ .base_address = &all_B, .extent = remaining });
+            rem_mem = @increment_dsd_offset(rem_mem, dH, f32);
+            const rem_fab = @get_dsd(fabin_dsd, .{
+                .fabric_color = broadcast_rx_color,
+                .extent = remaining,
+                .input_queue = broadcast_iq,
+            });
+            @fmovs(rem_mem, rem_fab, .{ .async = true });
+        }
+    }
+
     col_count += 1;
 
     // Check if we should trigger own B send
@@ -128,24 +127,24 @@ task column_done_task() void {
         }
     }
 
-    // Batched GEMV: red_in += A * buf_B
-    // Compiler unrolls with --max-inlined-iterations 150
+    // GEMV: red_in += A * all_B[col_offset..col_offset+dH]
+    const col_offset = (col_count - 1) * dH;
     var h: i16 = 0;
     while (h < dH) {
         const a_col = @increment_dsd_offset(
             @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
             h * dM, f32
         );
-        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B[h]);
+        @fmacs(red_in_dsd, red_in_dsd, a_col, all_B[@as(u16, col_offset + h)]);
         h += 1;
     }
 
-    // Synchronous reduce — provides flow control via fabric backpressure
+    // Synchronous reduce
     reduce();
 
-    // Arm next column receive if more columns expected
+    // Self-activate for next column
     if (reduce_col < total_columns) {
-        receive_next_column();
+        @activate(column_done_id);
     }
 }
 
@@ -164,8 +163,6 @@ fn setup_relay() void {
         .extent = total_upstream,
         .output_queue = broadcast_oq,
     });
-    // Relay all upstream wavelets at hardware speed (~1 cycle each)
-    // Runs on separate microthread, concurrent with receive/compute
     @fmovs(fabout_rx, fabin_tx, .{ .async = true });
 }
 
@@ -205,7 +202,6 @@ task send_done_task() void {
     if (send_col < dN_y) {
         send_next_column();
     } else if (my_y_val == 0) {
-        // All own columns sent — start bulk relay for upstream PEs
         setup_relay();
     }
 }
@@ -279,8 +275,14 @@ fn broadcast_pe() void {
     my_x_val = @as(i16, layout_mod.get_x_coord());
     my_send_start_col = @as(i16, my_y_val) * dN_y;
 
-    // Start DSD streaming receive for first B column
-    receive_next_column();
+    // Arm receive for first column only — activates column_done_task when complete
+    const first_col_mem = @get_dsd(mem1d_dsd, .{ .base_address = &all_B, .extent = dH });
+    const first_col_fab = @get_dsd(fabin_dsd, .{
+        .fabric_color = broadcast_rx_color,
+        .extent = dH,
+        .input_queue = broadcast_iq,
+    });
+    @fmovs(first_col_mem, first_col_fab, .{ .async = true, .activate = column_done_id });
 
     if (my_y_val == 0) {
         @activate(send_task_id);
@@ -295,7 +297,6 @@ fn terminate_kernel() void {
 comptime {
     @comptime_assert(@is_arch("wse2"));
 
-    // No data task bindings — using DSD streaming instead
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(column_done_task, column_done_id);
