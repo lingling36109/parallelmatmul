@@ -11,7 +11,6 @@ const timestamp = @import_module("<time>");
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
-// Local Memory
 var A: [dM * dH]f32;
 var B: [dH * dN_y]f32;
 var C: [dM * dN]f32;
@@ -28,17 +27,14 @@ const compute_task_id: local_task_id = @get_local_task_id(13);
 var send_col: i16 = 0;
 var recv_col: i16 = 0;
 
-// SENDER: Injects B data into the hardware bus
 task send_b_task() void {
     if (send_col >= dN_y) return;
     const out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .output_queue = @get_output_queue(2) });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
-
     @fmovs(out_dsd, b_ptr, .{ .async = true, .activate = send_task_id });
     send_col += 1;
 }
 
-// COMPUTE: Pulls data directly from the fabric via DSD
 task compute_task() void {
     if (recv_col >= dN_y) {
         timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[3]));
@@ -46,17 +42,18 @@ task compute_task() void {
         return;
     }
 
-    const fabin_bc = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .input_queue = @get_input_queue(2) });
     const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
+    const fabin_bc = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_color, .extent = 1, .input_queue = @get_input_queue(2) });
     var a_ptr = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
 
-    // Inner loop: Stream B from fabric, multiply with A rows
+    // The cycle-saver: Loop dH times, and for each incoming scalar from fabric,
+    // perform a vector-scalar MAC.
     for (@range(i16, dH)) |_| {
+        // Correct usage: @fmacs(dest, src1, src2, scalar_from_fabric)
         @fmacs(red_dsd, red_dsd, a_ptr, fabin_bc);
         a_ptr = @increment_dsd_offset(a_ptr, dM, f32);
     }
 
-    // Store result to C (Simulated reduction for local PE for this grid)
     const c_offset = recv_col * dM;
     const c_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM }), c_offset, f32);
     @fadds(c_dsd, red_dsd, @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
@@ -68,7 +65,6 @@ task compute_task() void {
 
 fn broadcast_pe() void {
     timestamp.enable_tsc();
-    // Use @ptrcast to *[3]u16 to satisfy the module's type requirement
     timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[0]));
 
     if (layout_mod.get_y_coord() == 0) {

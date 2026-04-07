@@ -14,7 +14,6 @@ const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
 
 const broadcast_color: color = @get_color(0);
-const reduce_color: color = @get_color(5); // Simplified for the 40k goal
 
 const memcpy = @import_module("<memcpy/get_params>", .{
   .width = kernel_x_dim,
@@ -44,8 +43,7 @@ layout {
         .{ .memcpy_params = memcpy.get_params(pe_x) }
       ));
 
-      // HARDWARE BROADCAST: No software relay.
-      // PE(x,0) takes from RAMP and sends SOUTH. Others take from NORTH and send SOUTH.
+      // HARDWARE BROADCAST
       if (pe_y == 0) {
         @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} } });
       } else if (pe_y == kernel_y_dim - 1) {
