@@ -37,8 +37,8 @@ task send_b_task() void {
     const out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .output_queue = @get_output_queue(2) });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // Synchronous move to prevent SimException
-    @fmovs(out_dsd, b_ptr, .{ .activate = send_task_id });
+    // FIX: Added .async = true as required by the compiler for .activate
+    @fmovs(out_dsd, b_ptr, .{ .async = true, .activate = send_task_id });
     send_col += 1;
 }
 
