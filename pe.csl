@@ -1,15 +1,9 @@
 // pe.csl
 param memcpy_params: comptime_struct;
-param dM: i16;
-param dN: i16;
-param dN_y: i16;
-param dH: i16;
-param kernel_x_dim: i16;
-param kernel_y_dim: i16;
-param broadcast_color: color;
-param reduce_tx_color: color;
-param reduce_rx_color: color;
-param scatter_color: color;
+param dM: i16; param dN: i16; param dN_y: i16; param dH: i16;
+param kernel_x_dim: i16; param kernel_y_dim: i16;
+param broadcast_color: color; param reduce_tx_color: color;
+param reduce_rx_color: color; param scatter_color: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
@@ -18,100 +12,72 @@ const timestamp = @import_module("<time>");
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
-// Storage
-var A: [dM * dH]f32;
-var B: [dH * dN_y]f32;
-var C: [dM * dN]f32;
+var A: [dM * dH]f32; var B: [dH * dN_y]f32; var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
-var ptr_A: [*]f32 = &A;
-var ptr_B: [*]f32 = &B;
-var ptr_C: [*]f32 = &C;
+var ptr_A: [*]f32 = &A; var ptr_B: [*]f32 = &B; var ptr_C: [*]f32 = &C;
 
-// DSDs
-const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
-const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
-const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
-
-const fabin_bc = @get_dsd(fabin_dsd, .{
-    .fabric_color = broadcast_color, .extent = dH, .input_queue = @get_input_queue(2)
-});
-
-// Tasks
 const send_task_id: local_task_id = @get_local_task_id(11);
 const compute_task_id: local_task_id = @get_local_task_id(13);
 
 var send_col: i16 = 0;
 var recv_col: i16 = 0;
 
-// BROADCAST SENDER (Only PE row 0)
 task send_b_task() void {
     if (send_col >= dN_y) return;
-
-    const out_dsd = @get_dsd(fabout_dsd, .{
-        .fabric_color = broadcast_color,
-        .extent = dH,
-        .output_queue = @get_output_queue(2),
-    });
-
+    const out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .output_queue = @get_output_queue(2) });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
     @fmovs(out_dsd, b_ptr, .{ .async = true });
-    
     send_col += 1;
-    @activate(send_task_id); // Loop until dN_y is sent
+    @activate(send_task_id);
 }
 
-// COMPUTE RECEIVER (All PEs)
 task compute_task() void {
-    if (recv_col >= dN_y) {
-        reduce();
-        return;
-    }
-
-    // GEMV: Process dH elements of B against dM rows of A
-    // This is the core cycle-saver: 1 task activation for dH * dM operations
+    if (recv_col >= dN_y) return;
+    const fabin_bc = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .input_queue = @get_input_queue(2) });
+    const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
     var a_ptr = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+
     for (@range(i16, dH)) |_| {
-        @fmacs(red_in_dsd, red_in_dsd, a_ptr, fabin_bc); 
+        @fmacs(red_dsd, red_dsd, a_ptr, fabin_bc);
         a_ptr = @increment_dsd_offset(a_ptr, dM, f32);
     }
+
+    // As each column finishes, trigger reduction logic
+    perform_reduction_step();
 
     recv_col += 1;
     @activate(compute_task_id);
 }
 
-fn reduce() void {
+fn perform_reduction_step() void {
     const my_x = @as(i16, layout_mod.get_x_coord());
-    const fsum_pe = 0; // Simplified for 8x8 example
-    
-    var c_col_dsd = @increment_dsd_offset(C_dsd, 0, f32); // Offset based on column index logic
+    const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
 
-    if (my_x == fsum_pe) {
-        @fadds(c_col_dsd, red_in_dsd, zeros_dsd, .{});
+    // Vertical slice logic: row 0 collects results for this simplified GEMV
+    if (my_x == 0) {
+        const c_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM }), recv_col * dM, f32);
+        @fadds(c_ptr, red_dsd, @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
     }
+    @fmovs(red_dsd, @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
-    timestamp.get_timestamp(@as([*]u16, &time_buf_u16[3]));
-    sys_mod.unblock_cmd_stream();
+    if (recv_col == dN_y - 1) {
+        timestamp.get_timestamp(@ptrcast([*]u16, &time_buf_u16[3]));
+        sys_mod.unblock_cmd_stream();
+    }
 }
 
 fn broadcast_pe() void {
     timestamp.enable_tsc();
-    timestamp.get_timestamp(@as([*]u16, &time_buf_u16[0]));
-
-    if (layout_mod.get_y_coord() == 0) {
-        @activate(send_task_id);
-    }
+    timestamp.get_timestamp(@ptrcast([*]u16, &time_buf_u16[0]));
+    if (layout_mod.get_y_coord() == 0) { @activate(send_task_id); }
     @activate(compute_task_id);
 }
 
 comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(compute_task, compute_task_id);
-
-    @export_symbol(ptr_A, "A");
-    @export_symbol(ptr_B, "B");
-    @export_symbol(ptr_C, "C");
-    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
-    @export_symbol(broadcast_pe);
+    @export_symbol(ptr_A, "A"); @export_symbol(ptr_B, "B"); @export_symbol(ptr_C, "C");
+    @export_symbol(ptr_time_buf_u16, "time_buf_u16"); @export_symbol(broadcast_pe);
 }
