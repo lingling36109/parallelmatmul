@@ -9,6 +9,8 @@ param broadcast_tx_color: color;
 param broadcast_rx_color: color;
 param reduce_tx_color: color;
 param reduce_rx_color: color;
+param pe_x: i16;
+param pe_y: i16;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
@@ -161,7 +163,7 @@ comptime {
   @bind_local_task(do_reduce, reduce_task_id);
   
   @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_rx_color));
-  if (layout_mod.get_y_coord() == 0) {
+  if (pe_y == 0) {
       @bind_data_task(color_swap_task, broadcast_rx_color);
   }
 
