@@ -4,7 +4,7 @@ param dM: i16; param dN: i16; param dN_y: i16; param dH: i16;
 param kernel_x_dim: i16; param kernel_y_dim: i16;
 param broadcast_color: color;
 param reduce_color: color;
-param sync_color: color; // New color for flow control
+param sync_color: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
@@ -16,7 +16,6 @@ var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
-// Pointers for export
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
@@ -34,7 +33,7 @@ var h_idx: i16 = 0;
 var n_idx: i16 = 0;
 var reduce_cnt: i16 = 0;
 
-// Broadcast Task: Remains ASYNC
+// Row 0 broadcasts one column of B asynchronously
 task send_b_task() void {
     if (send_col >= dN_y) return;
 
@@ -45,14 +44,11 @@ task send_b_task() void {
     });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // Perform broadcast asynchronously
     @fmovs(out_dsd, b_ptr, .{ .async = true });
-
     send_col += 1;
-    // We do NOT self-activate here.
-    // We wait for the sync_task to trigger the next column.
 }
 
+// Receive broadcasted wavelet and perform FMAC
 task recv_b_task(wavelet: f32) void {
     const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
     const a_col_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }), h_idx * dM, f32);
@@ -67,6 +63,7 @@ task recv_b_task(wavelet: f32) void {
     }
 }
 
+// Accumulate reduced results into local C
 task reduce_task(val: f32) void {
     C[n_idx * dM + reduce_cnt] += val;
     reduce_cnt += 1;
@@ -75,12 +72,10 @@ task reduce_task(val: f32) void {
         reduce_cnt = 0;
         n_idx += 1;
 
-        // Reset accumulator
         @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }),
                @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
-        // Signal the top row (PE y=0) that we are ready for the next broadcast
-        // This wavelet travels up the 'sync_color' path
+        // Signal completion to trigger the next broadcast
         const sync_out = @get_dsd(fabout_dsd, .{ .fabric_color = sync_color, .extent = 1, .output_queue = @get_output_queue(4) });
         const dummy: f32 = 0.0;
         @fmovs(sync_out, &dummy, .{ .async = true });
@@ -91,7 +86,7 @@ task reduce_task(val: f32) void {
     }
 }
 
-// Only active on Row 0: Receives sync from bottom to trigger next async broadcast
+// Row 0 triggers the next broadcast upon receiving the sync signal
 task sync_task(wavelet: f32) void {
     @activate(send_task_id);
 }
@@ -100,7 +95,6 @@ fn broadcast_pe() void {
     timestamp.enable_tsc();
     timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[0]));
 
-    // The very first broadcast must be triggered manually
     if (layout_mod.get_y_coord() == 0) {
         @activate(send_task_id);
     }
