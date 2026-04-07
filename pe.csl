@@ -3,14 +3,14 @@ param dM: i16;
 param dN: i16;
 param dN_y: i16;
 param dH: i16;
+param pe_x: i16;
+param pe_y: i16;
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
 param broadcast_tx_color: color;
 param broadcast_rx_color: color;
 param reduce_tx_color: color;
 param reduce_rx_color: color;
-param pe_x: i16;
-param pe_y: i16;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");

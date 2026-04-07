@@ -71,18 +71,18 @@ layout {
 
       // 1. Assign Pre-Computed Tile Codes
       if (pe_x == 0) {
-          @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .memcpy_params = memcpy.get_params(pe_x) }, params_0));
+          @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_0));
       } else if (pe_x == kernel_x_dim - 1) {
           if (pe_x % 2 == 1) {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .memcpy_params = memcpy.get_params(pe_x) }, params_last_odd));
+              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_last_odd));
           } else {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .memcpy_params = memcpy.get_params(pe_x) }, params_last_even));
+              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_last_even));
           }
       } else {
           if (pe_x % 2 == 1) {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .memcpy_params = memcpy.get_params(pe_x) }, params_odd));
+              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_odd));
           } else {
-              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .memcpy_params = memcpy.get_params(pe_x) }, params_even));
+              @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(.{ .pe_x = pe_x, .pe_y = pe_y, .memcpy_params = memcpy.get_params(pe_x) }, params_even));
           }
       }
 
