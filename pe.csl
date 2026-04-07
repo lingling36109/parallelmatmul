@@ -1,4 +1,3 @@
-// Parameters from layout
 param memcpy_params: comptime_struct;
 param dM: i16;
 param dN: i16;
@@ -6,65 +5,41 @@ param dN_y: i16;
 param dH: i16;
 param kernel_x_dim: i16;
 param kernel_y_dim: i16;
-param bcast_tx_color: color;
-param bcast_rx_color: color;
+param broadcast_tx_color: color;
+param broadcast_rx_color: color;
 param reduce_tx_color: color;
 param reduce_rx_color: color;
-param scatter_color: color;
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const tile_config = @import_module("<tile_config>");
+const ops = @import_module("<dsd_ops>");
 const timestamp = @import_module("<time>");
 
-// Comptime PE coordinates (passed from layout.csl)
-param my_x: i16;
-param my_y: i16;
-
-// =============================================================================
-// TSC timer buffers
-// =============================================================================
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 fn start_timer() void {
-    timestamp.enable_tsc();
-    timestamp.get_timestamp(&tscStartBuffer);
-    time_buf_u16[0] = tscStartBuffer[0];
-    time_buf_u16[1] = tscStartBuffer[1];
-    time_buf_u16[2] = tscStartBuffer[2];
+  timestamp.enable_tsc();
+  timestamp.get_timestamp(&tscStartBuffer);
+  time_buf_u16[0] = tscStartBuffer[0];
+  time_buf_u16[1] = tscStartBuffer[1];
+  time_buf_u16[2] = tscStartBuffer[2];
 }
 
 fn end_timer() void {
-    timestamp.get_timestamp(&tscEndBuffer);
-    time_buf_u16[3] = tscEndBuffer[0];
-    time_buf_u16[4] = tscEndBuffer[1];
-    time_buf_u16[5] = tscEndBuffer[2];
+  timestamp.get_timestamp(&tscEndBuffer);
+  time_buf_u16[3] = tscEndBuffer[0];
+  time_buf_u16[4] = tscEndBuffer[1];
+  time_buf_u16[5] = tscEndBuffer[2];
 }
 
-// =============================================================================
-// Queue declarations
-// =============================================================================
-// Broadcast: source PE sends on TX, all PEs receive on RX
-const bcast_tx_oq: output_queue = @get_output_queue(2);
-const bcast_rx_iq: input_queue = @get_input_queue(1);
-
-// Reduction (unchanged)
+const broadcast_oq: output_queue = @get_output_queue(2);
 const reduce_oq: output_queue = @get_output_queue(3);
 const reduce_iq: input_queue = @get_input_queue(2);
 
-const flyover_color: color = scatter_color;
-const flyover_oq: output_queue = @get_output_queue(4);
-const flyover_iq: input_queue = @get_input_queue(4);
-
-// Head PE reflector: bridges bcast_tx_color → bcast_rx_color (IQ 5 / OQ 5)
-// IQ 5 and OQ 5 are free; they don't overlap with reduce (IQ 2/OQ 3) or flyover (IQ 4/OQ 4).
-const bcast_reflect_iq: input_queue = @get_input_queue(5);
-const bcast_reflect_oq: output_queue = @get_output_queue(5);
-
-// =============================================================================
-// Storage
-// =============================================================================
 var A: [dM * dH]f32 = @zeros([dM * dH]f32);
 var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
@@ -73,269 +48,133 @@ var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-// Single B column buffer: receives one dH-vector per broadcast round
-var b_vec: [dH]f32 = @zeros([dH]f32);
-const b_vec_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &b_vec, .extent = dH });
+// Execution State
+var current_row: i16 = 0;
+var cols_received: i16 = 0;
+var elements_received: i16 = 0;
+var cols_sent: i16 = 0;
+var reduce_count: i16 = 0;
 
-// Accumulator for GEMV output
-var accum: [dM]f32 = @zeros([dM]f32);
-const accum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
+// Double Buffer for SAXPY
+var red_in: [2 * dM]f32 = @zeros([2 * dM]f32);
+var red_idx: i16 = 0;
 
-// Zero buffer for clearing accumulator
-const zeros_buf = @zeros([dM]f32);
-const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
+const send_task_id: local_task_id = @get_local_task_id(10);
+const reduce_task_id: local_task_id = @get_local_task_id(11);
 
-// =============================================================================
-// Fabric DSDs (comptime constants)
-// =============================================================================
-// All PEs receive broadcast data on bcast_rx_color
-const fabin_rx_dsd = @get_dsd(fabin_dsd, .{
-    .fabric_color = bcast_rx_color,
-    .extent = dH,
-    .input_queue = bcast_rx_iq,
-});
-
-// Source PEs send B columns on bcast_tx_color (synchronous)
-const fabout_tx_dsd = @get_dsd(fabout_dsd, .{
-    .fabric_color = bcast_tx_color,
-    .extent = dH,
-    .output_queue = bcast_tx_oq,
-});
-
-// Control DSD for SWITCH_ADV on bcast_tx_color (synchronous, 1 wavelet)
-const ctrl_dsd = @get_dsd(fabout_dsd, .{
-    .fabric_color = bcast_tx_color,
-    .extent = 1,
-    .control = true,
-    .output_queue = bcast_tx_oq,
-});
-
-// =============================================================================
-// Head PE reflector DSDs (only used when my_y == 0)
-// =============================================================================
-// Receive: read one B column (dH elements) arriving at head PE on bcast_tx_color
-const reflect_rx_dsd = @get_dsd(fabin_dsd, .{
-    .fabric_color = bcast_tx_color,
-    .extent = dH,
-    .input_queue = bcast_reflect_iq,
-});
-
-// Transmit: forward it out on bcast_rx_color, which routes SOUTH+RAMP to all PEs
-const reflect_tx_dsd = @get_dsd(fabout_dsd, .{
-    .fabric_color = bcast_rx_color,
-    .extent = dH,
-    .output_queue = bcast_reflect_oq,
-});
-
-// =============================================================================
-// SWITCH_ADV control wavelet
-// =============================================================================
-// The head PE's bcast_tx_color switch has 2 positions:
-//   pos1: rx=RAMP (head PE is source)
-//   pos2: rx=SOUTH (other PE is source)
-// SWITCH_ADV toggles between them. We send it:
-//   - After source 0 sends (pos1 → pos2, ready for source 1+)
-//   - After last source sends (pos2 → pos1, ready for next column's source 0)
-// The control wavelet payload encodes SWITCH_ADV opcode.
-var switch_adv_buf = [1]u32 { 1 }; // SWITCH_ADV payload (adjust encoding if needed)
-const switch_adv_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &switch_adv_buf, .extent = 1 });
-
-fn send_switch_adv() void {
-    // Synchronous control wavelet: advances head PE's TX switch position
-    @fmovs(ctrl_dsd, switch_adv_dsd);
+task send_b_task() void {
+    var tx_color = broadcast_rx_color;
+    if (layout_mod.get_y_coord() == 0) {
+        tx_color = broadcast_tx_color;
+    }
+    
+    var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = tx_color, .extent = 1, .output_queue = broadcast_oq });
+    
+    // Synchronous element delivery logic isolates the fabric layer from core competition
+    for (@range(u16, dH)) |i| {
+        @mov32(out_dsd, B[cols_sent * dH + i]);
+    }
+    cols_sent += 1;
 }
 
-// =============================================================================
-// Global state — sequential broadcast state machine
-// =============================================================================
-// Round-robin: for each column, cycle all sources
-var proc_source: i16 = 0;  // current source PE row (0..kernel_y_dim-1)
-var proc_col: i16 = 0;     // current B column index (0..dN_y-1)
-var total_reduces_done: i16 = 0;
+// Top-level forwarding task for the funnel
+task color_swap_task(data: f32) void {
+    var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_tx_color, .extent = 1, .output_queue = broadcast_oq });
+    @mov32(out_dsd, data);
+}
 
-// Task IDs (range 0-15, safe from system library conflicts at 21/27/28)
-// reflect_task_id MUST be lowest numerical ID (highest priority) so the reflector
-// re-arms color 1 before reduce_done_task runs start_round() and sends on color 1.
-// Without this ordering, a wavelet can arrive on color 1 while it is unblocked.
-const reflect_task_id: local_task_id = @get_local_task_id(0);
-const gemv_task_id: local_task_id = @get_local_task_id(1);
-const reduce_done_task_id: local_task_id = @get_local_task_id(2);
-
-// =============================================================================
-// Sequential broadcast: one (source, column) per round
-//
-// Flow per round:
-//   1. ALL PEs: arm async fabin on bcast_rx_color → b_vec
-//   2. Source PE: synchronous send on bcast_tx_color
-//      Head PE reflector cross-routes TX → RX, broadcasts DOWN
-//   3. Source PE: send SWITCH_ADV if needed (after source 0 or last source)
-//   4. fabin completes → gemv_task fires
-//   5. GEMV → reduce_async → reduce_done_task → next round
-// =============================================================================
-fn start_round() void {
-    // Arm bulk receive: head PE's reflector cross-routes TX→RX,
-    // so ALL PEs (including head) receive on bcast_rx_color.
-    @fmovs(b_vec_dsd, fabin_rx_dsd, .{ .async = true, .activate = gemv_task_id });
-
-    // If I'm the current source PE, synchronous send my B column on TX
-    if (my_y == proc_source) {
-        var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-        b_dsd = @increment_dsd_offset(b_dsd, proc_col * dH, f32);
-        @fmovs(fabout_tx_dsd, b_dsd, .{}); // synchronous: CE blocks until OQ drained
-
-        // SWITCH_ADV: toggle head PE's switch for next round
-        //   After source 0: pos1→pos2 (next source comes from SOUTH)
-        //   After last source: pos2→pos1 (next column starts with head PE = source 0)
-        if (proc_source == 0) {
-            send_switch_adv();
-        } else if (proc_source == kernel_y_dim - 1) {
-            send_switch_adv();
+task recv_broadcast_task(in_data: f32) void {
+    if (elements_received == 0) {
+        for (@range(u16, dM)) |i| {
+            red_in[red_idx * dM + i] = 0.0;
         }
     }
-    // CE returns; async fabin will fire gemv_task when dH wavelets arrive
-}
-
-// =============================================================================
-// GEMV task: accum += A * b_vec (one column, optimized DSD)
-// =============================================================================
-task gemv_task() void {
-    // Precompute base A-column DSD; advance by dM per h iteration
-    // A is stored column-major (A_MEMORY_TRANSPOSE=True): column h at offset h*dM
-    var a_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-    var h: i16 = 0;
-    while (h < dH) : (h += 1) {
-        @fmacs(accum_dsd, accum_dsd, a_col_dsd, b_vec[@as(u16, h)]);
-        if (h + 1 < dH) {
-            a_col_dsd = @increment_dsd_offset(a_col_dsd, dM, f32);
+    
+    var a_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
+    a_dsd = @set_dsd_base_addr(a_dsd, &A[elements_received * dM]);
+    
+    var red_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
+    red_dsd = @set_dsd_base_addr(red_dsd, &red_in[red_idx * dM]);
+    
+    ops.fmac(f32, f32, red_dsd, red_dsd, a_dsd, in_data, .{});
+    
+    elements_received += 1;
+    
+    if (elements_received == dH) {
+        elements_received = 0;
+        
+        @activate(reduce_task_id);
+        red_idx = 1 - red_idx;
+        
+        cols_received += 1;
+        current_row += 1;
+        if (current_row == kernel_y_dim) {
+            current_row = 0;
+        }
+        
+        if (current_row == layout_mod.get_y_coord() and cols_sent < dN_y) {
+            @activate(send_task_id);
         }
     }
-
-    // Launch async ring reduction for this partial column
-    const global_col = proc_source * dN_y + proc_col;
-    reduce_async(global_col);
 }
 
-// =============================================================================
-// Async Ring Reduction (unchanged)
-// =============================================================================
-fn reduce_async(global_col: i16) void {
-    // my_x is a comptime param from layout.csl — no layout_mod needed
-
-    const fsum_pe = global_col / dN;
+task do_reduce() void {
+    const k = reduce_count;
+    const fsum_pe = k % kernel_x_dim;
     const isum_pe = (fsum_pe + 1) % kernel_x_dim;
-    const local_c_col = global_col - fsum_pe * dN;
-
-    var c_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
-    c_col_dsd = @increment_dsd_offset(c_col_dsd, local_c_col * dM, f32);
-
-    const fabin_reduce = @get_dsd(fabin_dsd, .{
-        .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
-    });
-    const fabin_flyover = @get_dsd(fabin_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
-    });
-    const fabout_reduce = @get_dsd(fabout_dsd, .{
-        .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
-    });
-    const fabout_flyover = @get_dsd(fabout_dsd, .{
-        .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
-    });
-
-    if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
-    } else if (my_x == isum_pe) {
-        if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
-        } else {
-            @fmovs(fabout_reduce, accum_dsd, .{ .async = true, .activate = reduce_done_task_id });
-        }
-    } else if (my_x == fsum_pe) {
-        if (my_x == 0) {
-            @fadds(c_col_dsd, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
-        } else {
-            @fadds(c_col_dsd, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
-        }
+    const pe_x = layout_mod.get_x_coord();
+    
+    const finished_idx = 1 - red_idx;
+    var red_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
+    red_dsd = @set_dsd_base_addr(red_dsd, &red_in[finished_idx * dM]);
+    
+    var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq });
+    var in_dsd = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq });
+    
+    if (pe_x == isum_pe) {
+        @fmovs(out_dsd, red_dsd);
+    } else if (pe_x == fsum_pe) {
+        const my_c_col = k / kernel_x_dim;
+        var c_dest_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
+        c_dest_dsd = @set_dsd_base_addr(c_dest_dsd, &C[my_c_col * dM]);
+        @fadds(c_dest_dsd, in_dsd, red_dsd);
     } else {
-        if (my_x == 0) {
-            @fadds(fabout_reduce, accum_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
-        } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
-        } else {
-            @fadds(fabout_reduce, accum_dsd, fabin_reduce, .{ .async = true, .activate = reduce_done_task_id });
-        }
+        @fadds(out_dsd, in_dsd, red_dsd);
     }
-}
-
-// =============================================================================
-// Reduce done: clear accum, advance state, chain to next round
-// =============================================================================
-task reduce_done_task() void {
-    // Clear accumulator
-    @fmovs(accum_dsd, zeros_dsd, .{});
-
-    // Advance processing state (round-robin: cycle sources for each col)
-    proc_source += 1;
-    if (proc_source >= kernel_y_dim) {
-        proc_source = 0;
-        proc_col += 1;
-    }
-
-    total_reduces_done += 1;
-    if (total_reduces_done == @as(i16, kernel_y_dim) * dN_y) {
+    
+    reduce_count += 1;
+    // N total reductions needed
+    if (reduce_count == dN_y * kernel_y_dim) {
         terminate_kernel();
-        return;
     }
-
-    // Chain to next broadcast round
-    start_round();
 }
 
-// =============================================================================
-// Head PE reflector: continuous B-column relay bcast_tx → bcast_rx
-//
-// Activated once at kernel startup (via comptime @activate).
-// Each invocation issues one async fabric-to-fabric DMA:
-//   read dH elements from bcast_tx_color IQ 5  (arriving from source PEs)
-//   write dH elements to   bcast_rx_color OQ 5  (routed SOUTH + RAMP → all PEs)
-// On DMA completion, reactivates itself to pre-arm the next column's relay.
-// This runs for the entire kernel; the hanging arm after the last column is
-// harmless because the kernel terminates via unblock_cmd_stream().
-// =============================================================================
-task head_reflector_task() void {
-    @fmovs(reflect_tx_dsd, reflect_rx_dsd, .{ .async = true, .activate = reflect_task_id });
-}
-
-// =============================================================================
-// Entry point
-// =============================================================================
 fn broadcast_pe() void {
-    start_timer();
-    start_round();
+  start_timer();
+  if (layout_mod.get_y_coord() == 0) {
+      @activate(send_task_id);
+  }
 }
 
 fn terminate_kernel() void {
-    end_timer();
-    sys_mod.unblock_cmd_stream();
+  end_timer();
+  sys_mod.unblock_cmd_stream();
 }
 
 comptime {
-    @comptime_assert(@is_arch("wse2"));
+  @comptime_assert(@is_arch("wse2"));
+  
+  @bind_local_task(send_b_task, send_task_id);
+  @bind_local_task(do_reduce, reduce_task_id);
+  
+  @bind_data_task(recv_broadcast_task, broadcast_tx_color);
+  if (layout_mod.get_y_coord() == 0) {
+      @bind_data_task(color_swap_task, broadcast_rx_color);
+  }
 
-    // Bind local tasks
-    @bind_local_task(gemv_task, gemv_task_id);
-    @bind_local_task(reduce_done_task, reduce_done_task_id);
-
-    // Head PE (my_y == 0): bind and immediately activate the reflector.
-    // @activate in comptime schedules the task to fire at kernel startup,
-    // pre-arming the first async relay DMA before any source PE begins sending.
-    if (my_y == 0) {
-        @bind_local_task(head_reflector_task, reflect_task_id);
-        @activate(reflect_task_id);
-    }
-
-    @export_symbol(ptr_A, "A");
-    @export_symbol(ptr_B, "B");
-    @export_symbol(ptr_C, "C");
-    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
-    @export_symbol(broadcast_pe);
+  @export_symbol(ptr_A, "A");
+  @export_symbol(ptr_B, "B");
+  @export_symbol(ptr_C, "C");
+  @export_symbol(ptr_time_buf_u16, "time_buf_u16");
+  @export_symbol(broadcast_pe);
 }
