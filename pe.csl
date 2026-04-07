@@ -63,8 +63,6 @@ var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
-var acc0: [dM]f32 = @zeros([dM]f32);
-var acc1: [dM]f32 = @zeros([dM]f32);
 
 // Batch receive buffer — holds dN_y columns (one sending PE's worth)
 var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
@@ -78,8 +76,6 @@ const work_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &work_B, .extent = dH 
 // DSDs
 // =============================================================================
 const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
-const acc0_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &acc0, .extent = dM });
-const acc1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &acc1, .extent = dM });
 const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 
 const zeros_buf = @zeros([dM]f32);
@@ -121,10 +117,12 @@ const batch_done_id: local_task_id = @get_local_task_id(13);
 task batch_done_task() void {
     batch_count += 1;
 
-    // Process all dN_y columns in this batch
-    var col: i16 = 0;
-    while (col < dN_y) {
+    // Runtime bound prevents outer loop unrolling — keeps instruction footprint small
+    // (inner GEMV loop still unrolls via comptime dH bound)
+    var cols_remaining: i16 = dN_y;
+    while (cols_remaining > 0) {
         // Copy column from batch_B to work_B
+        const col = dN_y - cols_remaining;
         var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
         src = @increment_dsd_offset(src, col * dH, f32);
         @fmovs(work_B_dsd, src, .{});
@@ -138,33 +136,21 @@ task batch_done_task() void {
             }
         }
 
-        // GEMV with 2 accumulators to hide FPU pipeline stalls
+        // GEMV: red_in += A * work_B — inner loop unrolls (comptime dH)
         var h: i16 = 0;
         while (h < dH) {
-            const a_col_0 = @increment_dsd_offset(
+            const a_col = @increment_dsd_offset(
                 @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
                 h * dM, f32
             );
-            @fmacs(acc0_dsd, acc0_dsd, a_col_0, work_B[h]);
-
-            const a_col_1 = @increment_dsd_offset(
-                @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
-                (h + 1) * dM, f32
-            );
-            @fmacs(acc1_dsd, acc1_dsd, a_col_1, work_B[h + 1]);
-
-            h += 2;
+            @fmacs(red_in_dsd, red_in_dsd, a_col, work_B[h]);
+            h += 1;
         }
-
-        // Merge accumulators into red_in and clear them
-        @fadds(red_in_dsd, acc0_dsd, acc1_dsd, .{});
-        @fmovs(acc0_dsd, zeros_dsd, .{});
-        @fmovs(acc1_dsd, zeros_dsd, .{});
 
         // Synchronous reduce
         reduce();
 
-        col += 1;
+        cols_remaining -= 1;
     }
 
     // Arm next batch receive if more batches expected
@@ -315,7 +301,6 @@ fn terminate_kernel() void {
 
 comptime {
     @comptime_assert(@is_arch("wse2"));
-    @comptime_assert(dH % 2 == 0);
 
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
