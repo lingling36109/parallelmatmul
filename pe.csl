@@ -80,7 +80,15 @@ task send_b_task() void {
 // Intercepts the upward route and shifts to the downward route
 task color_swap_task(data: f32) void {
     var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_tx_color, .extent = 1, .output_queue = broadcast_oq });
-    @mov32(out_dsd, data);
+    task color_swap_task(data: f32) void {
+        var out_dsd = @get_dsd(fabout_dsd, .{
+            .fabric_color = broadcast_tx_color,
+            .extent = 1,
+            .output_queue = broadcast_oq
+        });
+        // Use @fmovs for f32 data
+        @fmovs(out_dsd, data);
+    }
 }
 
 task recv_broadcast_task(in_data: f32) void {
