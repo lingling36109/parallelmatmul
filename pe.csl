@@ -16,6 +16,7 @@ const layout_mod = @import_module("<layout>");
 const tile_config = @import_module("<tile_config>");
 const timestamp = @import_module("<time>");
 
+// TSC timer buffers
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
