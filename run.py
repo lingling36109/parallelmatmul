@@ -156,8 +156,8 @@ runner.memcpy_d2h(C_raw, C_symbol, 0, 0, kernel_x_dim, kernel_y_dim, dM_C * dN_C
 
 # Read back TSC timestamp buffer (14 x u16 per PE: start[0..2], end[0..2], profile[6..13])
 time_buf_symbol = runner.get_id('time_buf_u16')
-time_buf_raw = np.zeros(kernel_x_dim * kernel_y_dim * 18, dtype=np.uint32)
-runner.memcpy_d2h(time_buf_raw, time_buf_symbol, 0, 0, kernel_x_dim, kernel_y_dim, 18,
+time_buf_raw = np.zeros(kernel_x_dim * kernel_y_dim * 6, dtype=np.uint32)
+runner.memcpy_d2h(time_buf_raw, time_buf_symbol, 0, 0, kernel_x_dim, kernel_y_dim, 6,
   streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_16BIT,
   nonblock=False)
 
@@ -175,38 +175,17 @@ def make_u48(w):
   """Combine 3 x u16 words into a 48-bit timestamp."""
   return int(w[0]) + (int(w[1]) << 16) + (int(w[2]) << 32)
 
-time_buf_u16 = time_buf_raw.astype(np.uint16).reshape(kernel_y_dim, kernel_x_dim, 18)
+time_buf_u16 = time_buf_raw.astype(np.uint16).reshape(kernel_y_dim, kernel_x_dim, 6)
 
 cycles = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
-copy_cy = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
-gemv_cy = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
-reduce_cy = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
 
 for py in range(kernel_y_dim):
   for px in range(kernel_x_dim):
     t_start = make_u48(time_buf_u16[py, px, 0:3])
     t_end   = make_u48(time_buf_u16[py, px, 3:6])
     cycles[py, px] = t_end - t_start
-    # Profile timestamps for one representative column (col total_cols//2)
-    t0 = make_u48(time_buf_u16[py, px, 6:9])
-    t1 = make_u48(time_buf_u16[py, px, 9:12])
-    t2 = make_u48(time_buf_u16[py, px, 12:15])
-    t3 = make_u48(time_buf_u16[py, px, 15:18])
-    copy_cy[py, px] = t1 - t0
-    gemv_cy[py, px] = t2 - t1
-    reduce_cy[py, px] = t3 - t2
 
 print(f"\nTSC timer (cycles per PE):")
 print(f"  Min:  {cycles.min()}")
 print(f"  Max:  {cycles.max()}")
 print(f"  Mean: {cycles.mean():.1f}")
-
-total_cols = N
-print(f"\nProfile breakdown (single column @ col {total_cols//2}, mean across PEs):")
-print(f"  Copy+overhead: {copy_cy.mean():.0f} cy")
-print(f"  GEMV:          {gemv_cy.mean():.0f} cy")
-print(f"  Reduce:        {reduce_cy.mean():.0f} cy")
-per_col = copy_cy.mean() + gemv_cy.mean() + reduce_cy.mean()
-print(f"  Per-column:    {per_col:.0f} cy")
-print(f"  Estimated total ({total_cols} cols): {per_col * total_cols:.0f} cy")
-print(f"  Unaccounted:   {cycles.mean() - per_col * total_cols:.0f} cy (receive wait, batch transitions)")
