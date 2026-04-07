@@ -30,7 +30,7 @@ var h_idx: i16 = 0;
 var n_idx: i16 = 0;
 var reduce_cnt: i16 = 0;
 
-// FIX: Decoupled activation to prevent SimException instruction overwrites
+// Broadcast Task: Remains ASYNC
 task send_b_task() void {
     if (send_col >= dN_y) return;
 
@@ -41,12 +41,11 @@ task send_b_task() void {
     });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // Perform the move asynchronously WITHOUT an immediate self-activate
+    // We keep this async for performance
     @fmovs(out_dsd, b_ptr, .{ .async = true });
 
     send_col += 1;
-    // The next send will be triggered by the completion of the reduction phase
-    // to throttle the pipeline and prevent instruction slot competition.
+    // NOTE: Removed self-activation (@activate(send_task_id)) to prevent SimException
 }
 
 task recv_b_task(wavelet: f32) void {
@@ -59,6 +58,7 @@ task recv_b_task(wavelet: f32) void {
     if (h_idx == dH) {
         h_idx = 0;
         const out_red = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_color, .extent = dM, .output_queue = @get_output_queue(3) });
+        // Async move to the reduction network
         @fmovs(out_red, red_dsd, .{ .async = true });
     }
 }
@@ -76,10 +76,10 @@ task reduce_task(val: f32) void {
                @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
         if (n_idx == dN_y) {
-            timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[3]));
-            sys_mod.unblock_cmd_stream();
+            terminate_kernel();
         } else if (layout_mod.get_y_coord() == 0) {
-            // Trigger the next broadcast column only after the previous reduction finishes
+            // PIPELINE TRIGGER: The top row starts the next async broadcast
+            // only after the current column's reduction is in flight.
             @activate(send_task_id);
         }
     }
@@ -91,6 +91,11 @@ fn broadcast_pe() void {
     if (layout_mod.get_y_coord() == 0) {
         @activate(send_task_id);
     }
+}
+
+fn terminate_kernel() void {
+    timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[3]));
+    sys_mod.unblock_cmd_stream();
 }
 
 comptime {
