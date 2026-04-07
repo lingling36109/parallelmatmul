@@ -34,7 +34,6 @@ task send_b_task() void {
     send_col += 1;
 }
 
-// Data Task: Processes streaming broadcast from NORTH
 task recv_b_task(wavelet: f32) void {
     const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
     const a_col_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }), h_idx * dM, f32);
@@ -44,19 +43,13 @@ task recv_b_task(wavelet: f32) void {
     h_idx += 1;
     if (h_idx == dH) {
         h_idx = 0;
-        // Trigger horizontal reduction
         const out_red = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_color, .extent = dM, .output_queue = @get_output_queue(3) });
         @fmovs(out_red, red_dsd, .{ .async = true });
     }
 }
 
-// Data Task: Processes partial sums from EAST
 task reduce_task(val: f32) void {
     const my_x = layout_mod.get_x_coord();
-    const c_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM }), n_idx * dM, f32);
-
-    // Simple accumulator for the partial sum coming from East
-    // (In a high-perf version, you'd use DSDs here, but this ensures accuracy)
     C[n_idx * dM + reduce_cnt] += val;
 
     reduce_cnt += 1;
@@ -86,9 +79,9 @@ comptime {
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
 
-    @export_symbol(&A, "A");
-    @export_symbol(&B, "B");
-    @export_symbol(&C, "C");
+    @export_symbol(A);
+    @export_symbol(B);
+    @export_symbol(C);
     @export_symbol(ptr_time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
