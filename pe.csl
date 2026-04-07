@@ -164,7 +164,7 @@ comptime {
   
   @bind_data_task(recv_broadcast_task, @get_data_task_id(broadcast_rx_color));
   if (pe_y == 0) {
-      @bind_data_task(color_swap_task, broadcast_rx_color);
+      @bind_data_task(color_swap_task, @get_data_task_id(broadcast_rx_color));
   }
 
   @export_symbol(ptr_A, "A");
