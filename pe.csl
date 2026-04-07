@@ -19,8 +19,7 @@ const timestamp = @import_module("<time>");
 // TSC timer buffers
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
-// Extended: [0..5] = start/end TSC, [6..13] = profile data (4 x u16 pairs)
-var time_buf_u16 = @zeros([14]u16);
+var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 fn start_timer() void {
@@ -64,45 +63,6 @@ var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
-
-// Profiling: accumulate cycle counts per phase.
-// We use the lower 16 bits of TSC for per-phase deltas (each phase < 65536 cy).
-// Totals can exceed 65536, so we use two u16 words per counter (lo + hi).
-// time_buf_u16[6..7] = GEMV, [8..9] = reduce, [10..11] = copy, [12..13] = overhead
-var prof_gemv_lo: u16 = 0;
-var prof_gemv_hi: u16 = 0;
-var prof_reduce_lo: u16 = 0;
-var prof_reduce_hi: u16 = 0;
-var prof_copy_lo: u16 = 0;
-var prof_copy_hi: u16 = 0;
-var prof_overhead_lo: u16 = 0;
-var prof_overhead_hi: u16 = 0;
-var prof_tmp: [timestamp.tsc_size_words]u16 = @zeros([timestamp.tsc_size_words]u16);
-
-fn read_tsc_lo() u16 {
-    timestamp.get_timestamp(&prof_tmp);
-    return prof_tmp[0];
-}
-
-fn prof_add(lo_ptr: *u16, hi_ptr: *u16, delta: u16) void {
-    const old = lo_ptr.*;
-    lo_ptr.* = old + delta;
-    // If lo wrapped around, increment hi
-    if (lo_ptr.* < old) {
-        hi_ptr.* = hi_ptr.* + 1;
-    }
-}
-
-fn store_profile() void {
-    time_buf_u16[6] = prof_gemv_lo;
-    time_buf_u16[7] = prof_gemv_hi;
-    time_buf_u16[8] = prof_reduce_lo;
-    time_buf_u16[9] = prof_reduce_hi;
-    time_buf_u16[10] = prof_copy_lo;
-    time_buf_u16[11] = prof_copy_hi;
-    time_buf_u16[12] = prof_overhead_lo;
-    time_buf_u16[13] = prof_overhead_hi;
-}
 
 // Batch receive buffer — holds dN_y columns (one sending PE's worth)
 var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
@@ -155,21 +115,15 @@ const batch_done_id: local_task_id = @get_local_task_id(13);
 // Batch Done Task — process all dN_y columns, then arm next batch receive
 // =============================================================================
 task batch_done_task() void {
-    const t_batch = read_tsc_lo();
     batch_count += 1;
 
     // Process all dN_y columns in this batch
     var col: i16 = 0;
     while (col < dN_y) {
-        // --- Copy column from batch_B to work_B ---
-        const t0 = read_tsc_lo();
-
+        // Copy column from batch_B to work_B (sync, preserves comptime GEMV indexing)
         var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
         src = @increment_dsd_offset(src, col * dH, f32);
         @fmovs(work_B_dsd, src, .{});
-
-        const t1 = read_tsc_lo();
-        prof_add(&prof_copy_lo, &prof_copy_hi, t1 - t0);
 
         col_count += 1;
 
@@ -180,9 +134,7 @@ task batch_done_task() void {
             }
         }
 
-        // --- GEMV: red_in += A * work_B ---
-        const t2 = read_tsc_lo();
-
+        // GEMV: red_in += A * work_B — fixed base address, comptime h after unroll
         var h: i16 = 0;
         while (h < dH) {
             const a_col = @increment_dsd_offset(
@@ -193,24 +145,14 @@ task batch_done_task() void {
             h += 1;
         }
 
-        const t3 = read_tsc_lo();
-        prof_add(&prof_gemv_lo, &prof_gemv_hi, t3 - t2);
-
-        // --- Synchronous reduce ---
-        const t4 = read_tsc_lo();
-
+        // Synchronous reduce
         reduce();
-
-        const t5 = read_tsc_lo();
-        prof_add(&prof_reduce_lo, &prof_reduce_hi, t5 - t4);
 
         col += 1;
     }
 
     // Arm next batch receive if more batches expected
     if (batch_count < kernel_y_dim) {
-        const t6 = read_tsc_lo();
-        prof_add(&prof_overhead_lo, &prof_overhead_hi, t6 - t_batch);
         @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
     }
 }
@@ -351,7 +293,6 @@ fn broadcast_pe() void {
 }
 
 fn terminate_kernel() void {
-    store_profile();
     end_timer();
     sys_mod.unblock_cmd_stream();
 }
