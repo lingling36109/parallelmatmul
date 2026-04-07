@@ -139,11 +139,11 @@ runner.run()
 
 # Copy A and B to device
 runner.memcpy_h2d(A_symbol, A_prepared, 0, 0, kernel_x_dim, kernel_y_dim, A_wpe,
-  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
-  nonblock=False)
+                  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
+                  nonblock=False)
 runner.memcpy_h2d(B_symbol, B_prepared, 0, 0, kernel_x_dim, kernel_y_dim, B_wpe,
-  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
-  nonblock=False)
+                  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
+                  nonblock=False)
 
 # Launch the computation
 runner.launch('broadcast_pe', nonblock=False)
@@ -151,15 +151,15 @@ runner.launch('broadcast_pe', nonblock=False)
 # Read back C
 C_raw = np.zeros(kernel_x_dim * kernel_y_dim * dM_C * dN_C, dtype=np.float32)
 runner.memcpy_d2h(C_raw, C_symbol, 0, 0, kernel_x_dim, kernel_y_dim, dM_C * dN_C,
-  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
-  nonblock=False)
+                  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
+                  nonblock=False)
 
-# Read back TSC timestamp buffer (14 x u16 per PE: start[0..2], end[0..2], profile[6..13])
+# Read back TSC timestamp buffer (6 x u16 per PE: start[0..2], end[0..2])
 time_buf_symbol = runner.get_id('time_buf_u16')
 time_buf_raw = np.zeros(kernel_x_dim * kernel_y_dim * 6, dtype=np.uint32)
 runner.memcpy_d2h(time_buf_raw, time_buf_symbol, 0, 0, kernel_x_dim, kernel_y_dim, 6,
-  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_16BIT,
-  nonblock=False)
+                  streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_16BIT,
+                  nonblock=False)
 
 runner.stop()
 
@@ -178,7 +178,6 @@ def make_u48(w):
 time_buf_u16 = time_buf_raw.astype(np.uint16).reshape(kernel_y_dim, kernel_x_dim, 6)
 
 cycles = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
-
 for py in range(kernel_y_dim):
   for px in range(kernel_x_dim):
     t_start = make_u48(time_buf_u16[py, px, 0:3])
