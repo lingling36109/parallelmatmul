@@ -13,7 +13,6 @@ param reduce_rx_color: color;
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const tile_config = @import_module("<tile_config>");
-const ops = @import_module("<dsd_ops>");
 const timestamp = @import_module("<time>");
 
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
@@ -48,36 +47,35 @@ var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-// Execution State
 var current_row: i16 = 0;
 var cols_received: i16 = 0;
 var elements_received: i16 = 0;
 var cols_sent: i16 = 0;
 var reduce_count: i16 = 0;
 
-// Double Buffer for SAXPY
 var red_in: [2 * dM]f32 = @zeros([2 * dM]f32);
 var red_idx: i16 = 0;
 
 const send_task_id: local_task_id = @get_local_task_id(10);
 const reduce_task_id: local_task_id = @get_local_task_id(11);
 
+var A_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+
+// Accelerate Broadcast using @fmovs instead of a software loop
 task send_b_task() void {
     var tx_color = broadcast_rx_color;
     if (layout_mod.get_y_coord() == 0) {
         tx_color = broadcast_tx_color;
     }
-    
-    var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = tx_color, .extent = 1, .output_queue = broadcast_oq });
-    
-    // Synchronous element delivery logic isolates the fabric layer from core competition
-    for (@range(u16, dH)) |i| {
-        @mov32(out_dsd, B[cols_sent * dH + i]);
-    }
+
+    var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = tx_color, .extent = dH, .output_queue = broadcast_oq });
+    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B[cols_sent * dH], .extent = dH });
+
+    @fmovs(out_dsd, b_dsd, .{ .async = true });
     cols_sent += 1;
 }
 
-// Top-level forwarding task for the funnel
+// Intercepts the upward route and shifts to the downward route
 task color_swap_task(data: f32) void {
     var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_tx_color, .extent = 1, .output_queue = broadcast_oq });
     @mov32(out_dsd, data);
@@ -85,33 +83,31 @@ task color_swap_task(data: f32) void {
 
 task recv_broadcast_task(in_data: f32) void {
     if (elements_received == 0) {
+        A_dsd = @set_dsd_base_addr(A_dsd, &A);
         for (@range(u16, dM)) |i| {
             red_in[red_idx * dM + i] = 0.0;
         }
     }
-    
-    var a_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
-    a_dsd = @set_dsd_base_addr(a_dsd, &A[elements_received * dM]);
-    
-    var red_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
-    red_dsd = @set_dsd_base_addr(red_dsd, &red_in[red_idx * dM]);
-    
-    ops.fmac(f32, f32, red_dsd, red_dsd, a_dsd, in_data, .{});
-    
+
+    var red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[red_idx * dM], .extent = dM });
+
+    @fmacs(red_dsd, red_dsd, A_dsd, in_data);
+    A_dsd = @increment_dsd_offset(A_dsd, dM, f32); // Hardware stride
+
     elements_received += 1;
-    
+
     if (elements_received == dH) {
         elements_received = 0;
-        
+
         @activate(reduce_task_id);
-        red_idx = 1 - red_idx;
-        
+        red_idx = 1 - red_idx; // Double buffering step
+
         cols_received += 1;
         current_row += 1;
         if (current_row == kernel_y_dim) {
             current_row = 0;
         }
-        
+
         if (current_row == layout_mod.get_y_coord() and cols_sent < dN_y) {
             @activate(send_task_id);
         }
@@ -123,27 +119,24 @@ task do_reduce() void {
     const fsum_pe = k % kernel_x_dim;
     const isum_pe = (fsum_pe + 1) % kernel_x_dim;
     const pe_x = layout_mod.get_x_coord();
-    
+
     const finished_idx = 1 - red_idx;
-    var red_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
-    red_dsd = @set_dsd_base_addr(red_dsd, &red_in[finished_idx * dM]);
-    
+    var completed_red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[finished_idx * dM], .extent = dM });
+
     var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq });
     var in_dsd = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq });
-    
+
     if (pe_x == isum_pe) {
-        @fmovs(out_dsd, red_dsd);
+        @fmovs(out_dsd, completed_red_dsd, .{ .async = true });
     } else if (pe_x == fsum_pe) {
         const my_c_col = k / kernel_x_dim;
-        var c_dest_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |pointer|, .extent = dM });
-        c_dest_dsd = @set_dsd_base_addr(c_dest_dsd, &C[my_c_col * dM]);
-        @fadds(c_dest_dsd, in_dsd, red_dsd);
+        var c_dest_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C[my_c_col * dM], .extent = dM });
+        @fadds(c_dest_dsd, in_dsd, completed_red_dsd, .{ .async = true });
     } else {
-        @fadds(out_dsd, in_dsd, red_dsd);
+        @fadds(out_dsd, in_dsd, completed_red_dsd, .{ .async = true });
     }
-    
+
     reduce_count += 1;
-    // N total reductions needed
     if (reduce_count == dN_y * kernel_y_dim) {
         terminate_kernel();
     }
