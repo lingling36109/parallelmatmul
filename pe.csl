@@ -2,19 +2,21 @@
 param memcpy_params: comptime_struct;
 param dM: i16; param dN: i16; param dN_y: i16; param dH: i16;
 param kernel_x_dim: i16; param kernel_y_dim: i16;
-param broadcast_color: color; param reduce_color: color;
+param broadcast_color: color;
+param reduce_color: color;
+param sync_color: color; // New color for flow control
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-// Internal buffers
 var A: [dM * dH]f32;
 var B: [dH * dN_y]f32;
 var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
+// Pointers for export
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
@@ -25,13 +27,14 @@ var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 const send_task_id: local_task_id = @get_local_task_id(11);
 const recv_task_id: data_task_id = @get_data_task_id(broadcast_color);
 const reduce_task_id: data_task_id = @get_data_task_id(reduce_color);
+const sync_task_id: data_task_id = @get_data_task_id(sync_color);
 
 var send_col: i16 = 0;
 var h_idx: i16 = 0;
-var reduce_col: i16 = 0;
+var n_idx: i16 = 0;
 var reduce_cnt: i16 = 0;
 
-// Broadcast Task: Remains ASYNC but NO LONGER self-activates
+// Broadcast Task: Remains ASYNC
 task send_b_task() void {
     if (send_col >= dN_y) return;
 
@@ -42,10 +45,12 @@ task send_b_task() void {
     });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // Asynchronous move: allows overlapping with reduction of previous column
+    // Perform broadcast asynchronously
     @fmovs(out_dsd, b_ptr, .{ .async = true });
 
     send_col += 1;
+    // We do NOT self-activate here.
+    // We wait for the sync_task to trigger the next column.
 }
 
 task recv_b_task(wavelet: f32) void {
@@ -63,32 +68,39 @@ task recv_b_task(wavelet: f32) void {
 }
 
 task reduce_task(val: f32) void {
-    C[reduce_col * dM + reduce_cnt] += val;
+    C[n_idx * dM + reduce_cnt] += val;
     reduce_cnt += 1;
 
     if (reduce_cnt == dM) {
         reduce_cnt = 0;
-        reduce_col += 1;
+        n_idx += 1;
 
-        // Clear accumulator for next column
+        // Reset accumulator
         @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }),
                @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
-        if (reduce_col == dN_y) {
+        // Signal the top row (PE y=0) that we are ready for the next broadcast
+        // This wavelet travels up the 'sync_color' path
+        const sync_out = @get_dsd(fabout_dsd, .{ .fabric_color = sync_color, .extent = 1, .output_queue = @get_output_queue(4) });
+        const dummy: f32 = 0.0;
+        @fmovs(sync_out, &dummy, .{ .async = true });
+
+        if (n_idx == dN_y) {
             terminate_kernel();
-        } else if (layout_mod.get_y_coord() == 0) {
-            // Handshake: Trigger the next async broadcast only after the
-            // previous column has been fully reduced into C.
-            @activate(send_task_id);
         }
     }
+}
+
+// Only active on Row 0: Receives sync from bottom to trigger next async broadcast
+task sync_task(wavelet: f32) void {
+    @activate(send_task_id);
 }
 
 fn broadcast_pe() void {
     timestamp.enable_tsc();
     timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[0]));
 
-    // Initial trigger for the first column
+    // The very first broadcast must be triggered manually
     if (layout_mod.get_y_coord() == 0) {
         @activate(send_task_id);
     }
@@ -103,6 +115,7 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
+    @bind_data_task(sync_task, sync_task_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
