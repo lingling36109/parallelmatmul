@@ -19,7 +19,7 @@ const timestamp = @import_module("<time>");
 // TSC timer buffers
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
-var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
+var time_buf_u16 = @zeros([14]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 fn start_timer() void {
@@ -63,6 +63,35 @@ var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
+
+// Profiling: store cycle breakdown in extended time_buf_u16
+// time_buf_u16[0..5] = start/end TSC (standard)
+// time_buf_u16[6..7]  = total GEMV cycles (u32 as 2x u16)
+// time_buf_u16[8..9]  = total reduce cycles (u32 as 2x u16)
+// time_buf_u16[10..11] = total copy cycles (u32 as 2x u16)
+// time_buf_u16[12..13] = total batch overhead cycles (u32 as 2x u16)
+var gemv_cycles: u32 = 0;
+var reduce_cycles: u32 = 0;
+var copy_cycles: u32 = 0;
+var batch_overhead: u32 = 0;
+var prof_tmp: [timestamp.tsc_size_words]u16 = @zeros([timestamp.tsc_size_words]u16);
+
+fn read_tsc_u32() u32 {
+    timestamp.get_timestamp(&prof_tmp);
+    return @as(u32, prof_tmp[0]) | (@as(u32, prof_tmp[1]) << 16);
+}
+
+fn store_u32_as_u16(buf: [*]u16, offset: u16, val: u32) void {
+    buf[offset] = @as(u16, val & 0xFFFF);
+    buf[offset + 1] = @as(u16, (val >> 16) & 0xFFFF);
+}
+
+fn store_profile() void {
+    store_u32_as_u16(&time_buf_u16, 6, gemv_cycles);
+    store_u32_as_u16(&time_buf_u16, 8, reduce_cycles);
+    store_u32_as_u16(&time_buf_u16, 10, copy_cycles);
+    store_u32_as_u16(&time_buf_u16, 12, batch_overhead);
+}
 
 // Batch receive buffer — holds dN_y columns (one sending PE's worth)
 var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
@@ -115,15 +144,18 @@ const batch_done_id: local_task_id = @get_local_task_id(13);
 // Batch Done Task — process all dN_y columns, then arm next batch receive
 // =============================================================================
 task batch_done_task() void {
+    const t_batch_start = read_tsc_u32();
     batch_count += 1;
 
     // Process all dN_y columns in this batch
     var col: i16 = 0;
     while (col < dN_y) {
         // Copy column from batch_B to work_B (sync, preserves comptime GEMV indexing)
+        const t_copy_start = read_tsc_u32();
         var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
         src = @increment_dsd_offset(src, col * dH, f32);
         @fmovs(work_B_dsd, src, .{});
+        const t_copy_end = read_tsc_u32();
 
         col_count += 1;
 
@@ -135,6 +167,7 @@ task batch_done_task() void {
         }
 
         // GEMV: red_in += A * work_B — fixed base address, comptime h after unroll
+        const t_gemv_start = read_tsc_u32();
         var h: i16 = 0;
         while (h < dH) {
             const a_col = @increment_dsd_offset(
@@ -144,16 +177,26 @@ task batch_done_task() void {
             @fmacs(red_in_dsd, red_in_dsd, a_col, work_B[h]);
             h += 1;
         }
+        const t_gemv_end = read_tsc_u32();
 
         // Synchronous reduce
+        const t_reduce_start = read_tsc_u32();
         reduce();
+        const t_reduce_end = read_tsc_u32();
+
+        // Accumulate profile counters
+        gemv_cycles += t_gemv_end - t_gemv_start;
+        reduce_cycles += t_reduce_end - t_reduce_start;
+        copy_cycles += t_copy_end - t_copy_start;
 
         col += 1;
     }
 
     // Arm next batch receive if more batches expected
     if (batch_count < kernel_y_dim) {
+        const t_arm = read_tsc_u32();
         @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
+        batch_overhead += t_arm - t_batch_start;
     }
 }
 
@@ -293,6 +336,7 @@ fn broadcast_pe() void {
 }
 
 fn terminate_kernel() void {
+    store_profile();
     end_timer();
     sys_mod.unblock_cmd_stream();
 }

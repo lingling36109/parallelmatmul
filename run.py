@@ -154,10 +154,10 @@ runner.memcpy_d2h(C_raw, C_symbol, 0, 0, kernel_x_dim, kernel_y_dim, dM_C * dN_C
   streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT,
   nonblock=False)
 
-# Read back TSC timestamp buffer (6 x u16 per PE: start[0..2], end[0..2])
+# Read back TSC timestamp buffer (14 x u16 per PE: start[0..2], end[0..2], profile[6..13])
 time_buf_symbol = runner.get_id('time_buf_u16')
-time_buf_raw = np.zeros(kernel_x_dim * kernel_y_dim * 6, dtype=np.uint32)
-runner.memcpy_d2h(time_buf_raw, time_buf_symbol, 0, 0, kernel_x_dim, kernel_y_dim, 6,
+time_buf_raw = np.zeros(kernel_x_dim * kernel_y_dim * 14, dtype=np.uint32)
+runner.memcpy_d2h(time_buf_raw, time_buf_symbol, 0, 0, kernel_x_dim, kernel_y_dim, 14,
   streaming=False, order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_16BIT,
   nonblock=False)
 
@@ -175,16 +175,40 @@ def make_u48(w):
   """Combine 3 x u16 words into a 48-bit timestamp."""
   return int(w[0]) + (int(w[1]) << 16) + (int(w[2]) << 32)
 
-time_buf_u16 = time_buf_raw.astype(np.uint16).reshape(kernel_y_dim, kernel_x_dim, 6)
+time_buf_u16 = time_buf_raw.astype(np.uint16).reshape(kernel_y_dim, kernel_x_dim, 14)
 
 cycles = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
+gemv_tot = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
+reduce_tot = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
+copy_tot = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
+batch_tot = np.zeros((kernel_y_dim, kernel_x_dim), dtype=np.int64)
+
+def make_u32(w):
+  """Combine 2 x u16 words into a 32-bit value."""
+  return int(w[0]) + (int(w[1]) << 16)
+
 for py in range(kernel_y_dim):
   for px in range(kernel_x_dim):
     t_start = make_u48(time_buf_u16[py, px, 0:3])
     t_end   = make_u48(time_buf_u16[py, px, 3:6])
     cycles[py, px] = t_end - t_start
+    gemv_tot[py, px] = make_u32(time_buf_u16[py, px, 6:8])
+    reduce_tot[py, px] = make_u32(time_buf_u16[py, px, 8:10])
+    copy_tot[py, px] = make_u32(time_buf_u16[py, px, 10:12])
+    batch_tot[py, px] = make_u32(time_buf_u16[py, px, 12:14])
 
 print(f"\nTSC timer (cycles per PE):")
 print(f"  Min:  {cycles.min()}")
 print(f"  Max:  {cycles.max()}")
 print(f"  Mean: {cycles.mean():.1f}")
+
+# Profile breakdown (averages across all PEs)
+total_cols = (N // kernel_y_dim) * kernel_y_dim  # total_columns
+print(f"\nProfile breakdown (mean across PEs, {total_cols} columns):")
+print(f"  GEMV total:    {gemv_tot.mean():.0f} cy  ({gemv_tot.mean()/max(total_cols,1):.1f} cy/col)")
+print(f"  Reduce total:  {reduce_tot.mean():.0f} cy  ({reduce_tot.mean()/max(total_cols,1):.1f} cy/col)")
+print(f"  Copy total:    {copy_tot.mean():.0f} cy  ({copy_tot.mean()/max(total_cols,1):.1f} cy/col)")
+print(f"  Batch overhead:{batch_tot.mean():.0f} cy")
+accounted = gemv_tot.mean() + reduce_tot.mean() + copy_tot.mean() + batch_tot.mean()
+print(f"  Accounted:     {accounted:.0f} cy")
+print(f"  Unaccounted:   {cycles.mean() - accounted:.0f} cy (receive wait, task sched, profiling overhead)")
