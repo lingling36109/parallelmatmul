@@ -123,33 +123,53 @@ task recv_broadcast_task(in_data: f32) void {
 }
 
 task do_reduce() void {
-    // 1. Ensure the math uses unsigned integers for grid indices
+    // 1. Force all arithmetic for indices to u16
     const k = @as(u16, reduce_count);
-    const fsum_pe = @as(u16, k % kernel_x_dim);
-    const isum_pe = @as(u16, (fsum_pe + 1) % kernel_x_dim);
+    const x_dim = @as(u16, kernel_x_dim);
 
-    // 2. Map the runtime PE coordinate to u16
+    // Both sides of the modulo (%) must now be u16
+    const fsum_pe = k % x_dim;
+    const isum_pe = (fsum_pe + 1) % x_dim;
+
     const current_pe_x = @as(u16, pe_x);
+    const extent_u16 = @as(u16, dM);
 
     const finished_idx = 1 - red_idx;
-    var completed_red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[finished_idx * dM], .extent = dM });
+    var completed_red_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = &red_in[finished_idx * dM],
+        .extent = extent_u16
+    });
 
-    var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq });
-    var in_dsd = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq });
+    var out_dsd = @get_dsd(fabout_dsd, .{
+        .fabric_color = reduce_tx_color,
+        .extent = extent_u16,
+        .output_queue = reduce_oq
+    });
+    var in_dsd = @get_dsd(fabin_dsd, .{
+        .fabric_color = reduce_rx_color,
+        .extent = extent_u16,
+        .input_queue = reduce_iq
+    });
 
-    // 3. Compare u16 to u16
+    // 2. Compare u16 to u16
     if (current_pe_x == isum_pe) {
+        // Starter PE: Send local result to next PE in ring
         @fmovs(out_dsd, completed_red_dsd, .{ .async = true });
     } else if (current_pe_x == fsum_pe) {
-        const my_c_col = @as(u16, k / kernel_x_dim);
-        var c_dest_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C[my_c_col * dM], .extent = dM });
+        // Root PE: Receive from ring and add to the local C matrix column
+        const my_c_col = @as(i16, k / x_dim);
+        var c_dest_dsd = @get_dsd(mem1d_dsd, .{
+            .base_address = &C[my_c_col * dM],
+            .extent = extent_u16
+        });
         @fadds(c_dest_dsd, in_dsd, completed_red_dsd, .{ .async = true });
     } else {
+        // Intermediate PE: Add local result to incoming ring data and forward
         @fadds(out_dsd, in_dsd, completed_red_dsd, .{ .async = true });
     }
 
     reduce_count += 1;
-    // Cast the limit to i16 to match the signed reduce_count variable
+    // Termination check: cast the limit to i16 to match the signed reduce_count variable
     if (reduce_count == @as(i16, dN_y * kernel_y_dim)) {
         terminate_kernel();
     }
