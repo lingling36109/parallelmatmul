@@ -58,10 +58,14 @@ var reduce_count: i16 = 0;
 var red_in: [2 * dM]f32 = @zeros([2 * dM]f32);
 var red_idx: i16 = 0;
 
+// Double buffer for B column reception (Optimization A)
+var buf_B: [2 * dH]f32 = @zeros([2 * dH]f32);
+var buf_idx: i16 = 0;        // buffer currently being filled
+var compute_buf_idx: i16 = 0; // buffer to compute on (set when full)
+
 const send_task_id: local_task_id = @get_local_task_id(10);
 const reduce_task_id: local_task_id = @get_local_task_id(11);
-
-var A_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+const compute_task_id: local_task_id = @get_local_task_id(12);
 
 // Accelerate Broadcast using @fmovs instead of a software loop
 task send_b_task() void {
@@ -78,48 +82,81 @@ task send_b_task() void {
 }
 
 // Intercepts the upward route and shifts to the downward route
+// Also buffers B data for y=0 PE's own computation (Optimization A + C)
 task color_swap_task(data: f32) void {
+    // Forward to broadcast_tx_color (original behavior)
     var out_dsd = @get_dsd(fabout_dsd, .{
         .fabric_color = broadcast_tx_color,
         .extent = 1,
         .output_queue = broadcast_oq
     });
-
     @fmovs(out_dsd, data);
-}
 
-task recv_broadcast_task(in_data: f32) void {
-    if (elements_received == 0) {
-        A_dsd = @set_dsd_base_addr(A_dsd, &A);
-        // Use i16 for the range to match red_idx and dM types
-        for (@range(i16, dM)) |i| {
-            red_in[red_idx * dM + i] = 0.0;
-        }
-    }
-
-    var red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[red_idx * dM], .extent = dM });
-
-    @fmacs(red_dsd, red_dsd, A_dsd, in_data);
-    A_dsd = @increment_dsd_offset(A_dsd, dM, f32); // Hardware stride
-
+    // Buffer for local computation
+    buf_B[buf_idx * dH + elements_received] = data;
     elements_received += 1;
 
     if (elements_received == dH) {
         elements_received = 0;
-
-        @activate(reduce_task_id);
-        red_idx = 1 - red_idx; // Double buffering step
+        compute_buf_idx = buf_idx;
+        buf_idx = 1 - buf_idx;
+        @activate(compute_task_id);
 
         cols_received += 1;
         current_row += 1;
         if (current_row == kernel_y_dim) {
             current_row = 0;
         }
-
         if (@as(u16, current_row) == layout_mod.get_y_coord() and cols_sent < dN_y) {
-            @activate(send_b_task_id);
+            @activate(send_task_id);
         }
     }
+}
+
+// Lightweight store-only data task (Optimization A + C)
+// Stores each wavelet into buf_B instead of doing @fmacs per wavelet.
+// Reduces per-wavelet RAMP stall from ~dM cycles to ~1 cycle.
+task recv_broadcast_task(in_data: f32) void {
+    buf_B[buf_idx * dH + elements_received] = in_data;
+    elements_received += 1;
+
+    if (elements_received == dH) {
+        elements_received = 0;
+        compute_buf_idx = buf_idx;
+        buf_idx = 1 - buf_idx;
+        @activate(compute_task_id);
+
+        cols_received += 1;
+        current_row += 1;
+        if (current_row == kernel_y_dim) {
+            current_row = 0;
+        }
+        if (@as(u16, current_row) == layout_mod.get_y_coord() and cols_sent < dN_y) {
+            @activate(send_task_id);
+        }
+    }
+}
+
+// Full GEMV on a complete buffered B-column (Optimization A + B)
+// Processes buf_B[compute_buf_idx] against local A, accumulating into red_in.
+task do_compute() void {
+    const cidx = compute_buf_idx;
+
+    // Zero the accumulation buffer using DSD (Optimization B: hardware zeroing)
+    var red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[red_idx * dM], .extent = @as(u16, dM) });
+    @fmovs(red_dsd, @as(f32, 0.0));
+
+    // GEMV inner loop: red_in += A * buf_B (Optimization B: tight @fmacs loop)
+    var a_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = @as(u16, dM) });
+    for (@range(i16, dH)) |h| {
+        red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[red_idx * dM], .extent = @as(u16, dM) });
+        @fmacs(red_dsd, red_dsd, a_dsd, buf_B[cidx * dH + h]);
+        a_dsd = @increment_dsd_offset(a_dsd, @as(u16, dM), f32);
+    }
+
+    // Trigger reduction and swap red_in buffer
+    @activate(reduce_task_id);
+    red_idx = 1 - red_idx;
 }
 
 task do_reduce() void {
@@ -192,6 +229,7 @@ comptime {
 
   @bind_local_task(send_b_task, send_task_id);
   @bind_local_task(do_reduce, reduce_task_id);
+  @bind_local_task(do_compute, compute_task_id);
 
   // Use an if/else to ensure only one binding per PE
   if (pe_y == 0) {
