@@ -1,4 +1,3 @@
-// Parameters from layout
 param memcpy_params: comptime_struct;
 param dM: i16;
 param dN: i16;
