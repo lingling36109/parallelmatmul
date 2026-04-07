@@ -64,12 +64,13 @@ var ptr_C: [*]f32 = &C;
 
 var red_in: [dM]f32 = @zeros([dM]f32);
 
-// Total columns to process
-const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
+// Receive buffer — incoming column data lands here
+var buf_B: [dH]f32 = @zeros([dH]f32);
+const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
 
-// Large receive buffer — each column gets its own dH-sized slot.
-// Receive into all_B[col*dH], process from all_B[col*dH]. No aliasing.
-var all_B: [total_columns * dH]f32 = @zeros([total_columns * dH]f32);
+// Work buffer — GEMV reads from here (fixed base, comptime offsets)
+var work_B: [dH]f32 = @zeros([dH]f32);
+const work_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &work_B, .extent = dH });
 
 // =============================================================================
 // DSDs
@@ -79,6 +80,13 @@ const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
+
+// DSD for streaming receive from broadcast fabric
+const fabin_broadcast = @get_dsd(fabin_dsd, .{
+    .fabric_color = broadcast_rx_color,
+    .extent = dH,
+    .input_queue = broadcast_iq,
+});
 
 // =============================================================================
 // State variables
@@ -94,54 +102,50 @@ var my_x_val: i16 = 0;
 var my_y_val: u16 = 0;
 var my_send_start_col: i16 = 0;
 
+// Total columns to process
+const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
+
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
 const column_done_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// Column Done Task — arm next receive FIRST, then GEMV + reduce
+// Column Done Task — copy, arm next receive, then GEMV + reduce
 // =============================================================================
 task column_done_task() void {
-    col_count += 1;
+    // 1. Copy received data to work buffer (sync, ~dH cycles).
+    //    Also provides safe gap for previous receive's microthread slot to retire.
+    @fmovs(work_B_dsd, buf_B_dsd, .{});
 
-    // Immediately arm receive for NEXT column into its all_B slot.
-    // This keeps fabin active during GEMV+reduce (~750 cycles),
-    // preventing backpressure. The next column_done_task fires only
-    // when the next column's data has actually arrived.
+    // 2. Arm receive for NEXT column into buf_B (async).
+    //    fabin stays ACTIVE during the entire GEMV+reduce (~750 cycles),
+    //    preventing backpressure on incoming wavelets.
+    col_count += 1;
     if (col_count < total_columns) {
-        var next_mem = @get_dsd(mem1d_dsd, .{ .base_address = &all_B, .extent = dH });
-        next_mem = @increment_dsd_offset(next_mem, col_count * dH, f32);
-        const next_fab = @get_dsd(fabin_dsd, .{
-            .fabric_color = broadcast_rx_color,
-            .extent = dH,
-            .input_queue = broadcast_iq,
-        });
-        @fmovs(next_mem, next_fab, .{ .async = true, .activate = column_done_id });
+        @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
     }
 
-    // Check if we should trigger own B send
+    // 3. Trigger own B send
     if (!has_sent) {
         if (col_count >= my_send_start_col) {
             @activate(send_task_id);
         }
     }
 
-    // GEMV: red_in += A * all_B[col_offset..col_offset+dH]
-    const col_offset = (col_count - 1) * dH;
+    // 4. GEMV: red_in += A * work_B — fixed base address, comptime h after unroll
     var h: i16 = 0;
     while (h < dH) {
         const a_col = @increment_dsd_offset(
             @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
             h * dM, f32
         );
-        @fmacs(red_in_dsd, red_in_dsd, a_col, all_B[@as(u16, col_offset + h)]);
+        @fmacs(red_in_dsd, red_in_dsd, a_col, work_B[h]);
         h += 1;
     }
 
-    // Synchronous reduce
+    // 5. Synchronous reduce
     reduce();
-    // No self-activate — next column_done fires when next receive completes
 }
 
 // =============================================================================
@@ -271,14 +275,8 @@ fn broadcast_pe() void {
     my_x_val = @as(i16, layout_mod.get_x_coord());
     my_send_start_col = @as(i16, my_y_val) * dN_y;
 
-    // Arm receive for first column into all_B[0..dH]
-    const first_mem = @get_dsd(mem1d_dsd, .{ .base_address = &all_B, .extent = dH });
-    const first_fab = @get_dsd(fabin_dsd, .{
-        .fabric_color = broadcast_rx_color,
-        .extent = dH,
-        .input_queue = broadcast_iq,
-    });
-    @fmovs(first_mem, first_fab, .{ .async = true, .activate = column_done_id });
+    // Arm first column receive into buf_B
+    @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
 
     if (my_y_val == 0) {
         @activate(send_task_id);
