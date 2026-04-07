@@ -8,14 +8,12 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-// Internal buffers
 var A: [dM * dH]f32;
 var B: [dH * dN_y]f32;
 var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
-// Create pointers for exporting (to fix "@export_symbol" error)
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
@@ -32,14 +30,23 @@ var h_idx: i16 = 0;
 var n_idx: i16 = 0;
 var reduce_cnt: i16 = 0;
 
+// FIX: Decoupled activation to prevent SimException instruction overwrites
 task send_b_task() void {
     if (send_col >= dN_y) return;
-    const out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .output_queue = @get_output_queue(2) });
+
+    const out_dsd = @get_dsd(fabout_dsd, .{
+        .fabric_color = broadcast_color,
+        .extent = dH,
+        .output_queue = @get_output_queue(2)
+    });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // FIX: Added .async = true as required by the compiler for .activate
-    @fmovs(out_dsd, b_ptr, .{ .async = true, .activate = send_task_id });
+    // Perform the move asynchronously WITHOUT an immediate self-activate
+    @fmovs(out_dsd, b_ptr, .{ .async = true });
+
     send_col += 1;
+    // The next send will be triggered by the completion of the reduction phase
+    // to throttle the pipeline and prevent instruction slot competition.
 }
 
 task recv_b_task(wavelet: f32) void {
@@ -58,16 +65,22 @@ task recv_b_task(wavelet: f32) void {
 
 task reduce_task(val: f32) void {
     C[n_idx * dM + reduce_cnt] += val;
-
     reduce_cnt += 1;
+
     if (reduce_cnt == dM) {
         reduce_cnt = 0;
         n_idx += 1;
-        @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }), @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
+
+        // Reset local accumulator
+        @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }),
+               @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
         if (n_idx == dN_y) {
             timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[3]));
             sys_mod.unblock_cmd_stream();
+        } else if (layout_mod.get_y_coord() == 0) {
+            // Trigger the next broadcast column only after the previous reduction finishes
+            @activate(send_task_id);
         }
     }
 }
@@ -85,7 +98,6 @@ comptime {
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
 
-    // FIX: Exporting the pointers instead of the arrays
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
     @export_symbol(ptr_C, "C");
