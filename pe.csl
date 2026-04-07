@@ -15,6 +15,11 @@ var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
+// These pointer variables are what we actually export
+var ptr_A: [*]f32 = &A;
+var ptr_B: [*]f32 = &B;
+var ptr_C: [*]f32 = &C;
+
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
 var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
@@ -85,10 +90,10 @@ comptime {
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
 
-    // FIX: Removed '&' to export the global symbol correctly
-    @export_symbol(A, "A");
-    @export_symbol(B, "B");
-    @export_symbol(C, "C");
+    // FIX: Export the pointers, NOT the arrays
+    @export_symbol(ptr_A, "A");
+    @export_symbol(ptr_B, "B");
+    @export_symbol(ptr_C, "C");
     @export_symbol(ptr_time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
