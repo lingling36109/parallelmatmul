@@ -1,5 +1,4 @@
 // Color map
-//
 //  ID var                   ID var  ID var               ID var
 //   0 broadcast_rx_color    9       18                   27 reserved (memcpy)
 //   1 broadcast_tx_color    10      19                   28 reserved (memcpy)
