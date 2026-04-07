@@ -37,8 +37,8 @@ layout {
         .kernel_y_dim = kernel_y_dim,
     };
 
-    for (let pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x += 1) {
-        for (let pe_y: i16 = 0; pe_y < kernel_y_dim; pe_y += 1) {
+    for (var pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x += 1) {
+        for (var pe_y: i16 = 0; pe_y < kernel_y_dim; pe_y += 1) {
             @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
                 common_params,
                 .{
@@ -75,7 +75,7 @@ layout {
         }
     }
 
-    for (let pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x += 1) {
+    for (var pe_x: i16 = 0; pe_x < kernel_x_dim; pe_x += 1) {
         @set_color_config(pe_x, 0, MEMCPYH2D_DATA_1, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
         @set_color_config(pe_x, 0, MEMCPYH2D_DATA_2, .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
         @set_color_config(pe_x, 0, MEMCPYD2H_DATA_1, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
