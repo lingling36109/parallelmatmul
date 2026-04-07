@@ -8,6 +8,7 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
+// Internal buffers
 var A: [dM * dH]f32;
 var B: [dH * dN_y]f32;
 var C: [dM * dN]f32;
@@ -27,10 +28,10 @@ const reduce_task_id: data_task_id = @get_data_task_id(reduce_color);
 
 var send_col: i16 = 0;
 var h_idx: i16 = 0;
-var n_idx: i16 = 0;
+var reduce_col: i16 = 0;
 var reduce_cnt: i16 = 0;
 
-// Broadcast Task: Remains ASYNC
+// Broadcast Task: Remains ASYNC but NO LONGER self-activates
 task send_b_task() void {
     if (send_col >= dN_y) return;
 
@@ -41,11 +42,10 @@ task send_b_task() void {
     });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // We keep this async for performance
+    // Asynchronous move: allows overlapping with reduction of previous column
     @fmovs(out_dsd, b_ptr, .{ .async = true });
 
     send_col += 1;
-    // NOTE: Removed self-activation (@activate(send_task_id)) to prevent SimException
 }
 
 task recv_b_task(wavelet: f32) void {
@@ -58,28 +58,27 @@ task recv_b_task(wavelet: f32) void {
     if (h_idx == dH) {
         h_idx = 0;
         const out_red = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_color, .extent = dM, .output_queue = @get_output_queue(3) });
-        // Async move to the reduction network
         @fmovs(out_red, red_dsd, .{ .async = true });
     }
 }
 
 task reduce_task(val: f32) void {
-    C[n_idx * dM + reduce_cnt] += val;
+    C[reduce_col * dM + reduce_cnt] += val;
     reduce_cnt += 1;
 
     if (reduce_cnt == dM) {
         reduce_cnt = 0;
-        n_idx += 1;
+        reduce_col += 1;
 
-        // Reset local accumulator
+        // Clear accumulator for next column
         @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }),
                @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
-        if (n_idx == dN_y) {
+        if (reduce_col == dN_y) {
             terminate_kernel();
         } else if (layout_mod.get_y_coord() == 0) {
-            // PIPELINE TRIGGER: The top row starts the next async broadcast
-            // only after the current column's reduction is in flight.
+            // Handshake: Trigger the next async broadcast only after the
+            // previous column has been fully reduced into C.
             @activate(send_task_id);
         }
     }
@@ -88,6 +87,8 @@ task reduce_task(val: f32) void {
 fn broadcast_pe() void {
     timestamp.enable_tsc();
     timestamp.get_timestamp(@ptrcast(*[3]u16, &time_buf_u16[0]));
+
+    // Initial trigger for the first column
     if (layout_mod.get_y_coord() == 0) {
         @activate(send_task_id);
     }
