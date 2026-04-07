@@ -123,10 +123,13 @@ task recv_broadcast_task(in_data: f32) void {
 }
 
 task do_reduce() void {
-    const k = reduce_count;
-    const fsum_pe = k % kernel_x_dim;
-    const isum_pe = (fsum_pe + 1) % kernel_x_dim;
-    const pe_x = layout_mod.get_x_coord();
+    // 1. Ensure the math uses unsigned integers for grid indices
+    const k = @as(u16, reduce_count);
+    const fsum_pe = @as(u16, k % kernel_x_dim);
+    const isum_pe = @as(u16, (fsum_pe + 1) % kernel_x_dim);
+
+    // 2. Map the runtime PE coordinate to u16
+    const current_pe_x = @as(u16, pe_x);
 
     const finished_idx = 1 - red_idx;
     var completed_red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in[finished_idx * dM], .extent = dM });
@@ -134,10 +137,11 @@ task do_reduce() void {
     var out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq });
     var in_dsd = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq });
 
-    if (@as(u16, pe_x) == isum_pe) {
+    // 3. Compare u16 to u16
+    if (current_pe_x == isum_pe) {
         @fmovs(out_dsd, completed_red_dsd, .{ .async = true });
-    } else if (@as(u16, pe_x) == fsum_pe) {
-        const my_c_col = k / kernel_x_dim;
+    } else if (current_pe_x == fsum_pe) {
+        const my_c_col = @as(u16, k / kernel_x_dim);
         var c_dest_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C[my_c_col * dM], .extent = dM });
         @fadds(c_dest_dsd, in_dsd, completed_red_dsd, .{ .async = true });
     } else {
@@ -145,7 +149,8 @@ task do_reduce() void {
     }
 
     reduce_count += 1;
-    if (reduce_count == dN_y * kernel_y_dim) {
+    // Cast the limit to i16 to match the signed reduce_count variable
+    if (reduce_count == @as(i16, dN_y * kernel_y_dim)) {
         terminate_kernel();
     }
 }
