@@ -20,14 +20,13 @@
 # =============================================================================
 
 # --- Matrix A (M x H) ---
-A_GLOBAL_TRANSPOSE = False  # M→Y, H→X => local block is (dM, dH) = (M/Ky, H/Kx)
-A_MEMORY_TRANSPOSE = True   # store column-major so A columns (length dM) are contiguous for SAXPY
+A_GLOBAL_TRANSPOSE = False
+A_MEMORY_TRANSPOSE = True
 
 # --- Matrix B (H x N) ---
-B_GLOBAL_TRANSPOSE = True   # H→X, N→Y => local block is (dH, dN_y) = (H/Kx, N/Ky)
-B_MEMORY_TRANSPOSE = True   # store column-major so B columns (length dH) are contiguous for broadcast
+B_GLOBAL_TRANSPOSE = True
+B_MEMORY_TRANSPOSE = True
 
 # --- Matrix C (M x N) ---
-C_GLOBAL_TRANSPOSE = False  # M→Y, N→X => local block is (dM, dN) = (M/Ky, N/Kx)
-C_MEMORY_TRANSPOSE = True   # store column-major so C columns (length dM) are contiguous for reduction writes
-
+C_GLOBAL_TRANSPOSE = False
+C_MEMORY_TRANSPOSE = True

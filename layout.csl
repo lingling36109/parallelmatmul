@@ -148,10 +148,10 @@ layout {
 
       if (pe_y == 0) {
         @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
-            .routes = .{ .rx = .{SOUTH}, .color_swap_y = true },
+          .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} },
         });
         @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
-            .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP}, .color_swap_y = true },
+          .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} },
         });
       } else if (pe_y == kernel_y_dim - 1) {
         @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
@@ -162,7 +162,7 @@ layout {
         });
       } else {
         @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
-          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} }, 
+          .routes = .{ .rx = .{SOUTH, RAMP}, .tx = .{NORTH} },
         });
         @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
           .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} },
@@ -202,7 +202,7 @@ layout {
         });
       } else {
         @set_color_config(pe_x, pe_y, reduce_C_color, .{
-          .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} },
+          .routes = .{ .rx = .{EAST}, .tx = .{WEST} }, // Removed RAMP
         });
       }
     }
@@ -215,4 +215,3 @@ layout {
   @export_name("time_buf_u16", [*]u16, true);
   @export_name("broadcast_pe", fn () void);
 }
-
