@@ -91,7 +91,8 @@ task color_swap_task(data: f32) void {
 task recv_broadcast_task(in_data: f32) void {
     if (elements_received == 0) {
         A_dsd = @set_dsd_base_addr(A_dsd, &A);
-        for (@range(u16, dM)) |i| {
+        // Use i16 for the range to match red_idx and dM types
+        for (@range(i16, dM)) |i| {
             red_in[red_idx * dM + i] = 0.0;
         }
     }
