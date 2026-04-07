@@ -5,10 +5,12 @@ param M: i16;
 param H: i16;
 param N: i16;
 
+// IDs for memcpy streaming colors
 param MEMCPYH2D_DATA_1_ID: i16;
 param MEMCPYH2D_DATA_2_ID: i16;
 param MEMCPYD2H_DATA_1_ID: i16;
 
+// Colors
 const MEMCPYH2D_DATA_1: color = @get_color(MEMCPYH2D_DATA_1_ID);
 const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
 const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
@@ -46,6 +48,9 @@ layout {
             ));
 
             // --- Broadcast Routing (North -> South) ---
+            // Row 0: Receives from RAMP (local B), sends to SOUTH and RAMP
+            // Middle: Receives from NORTH, sends to SOUTH and RAMP
+            // Last Row: Receives from NORTH, sends to RAMP
             const b_routes = if (pe_y == 0)
                 .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} }
             else if (pe_y == kernel_y_dim - 1)
@@ -55,6 +60,9 @@ layout {
             @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = b_routes });
 
             // --- Reduction Routing (East -> West) ---
+            // PE(kx-1): Receives from RAMP (local sum), sends to WEST
+            // PE(0): Receives from EAST, sends to RAMP (final storage)
+            // Middle: Receives from EAST, sends to WEST and RAMP (accumulator)
             const r_routes = if (pe_x == kernel_x_dim - 1)
                 .{ .rx = .{RAMP}, .tx = .{WEST} }
             else if (pe_x == 0)
@@ -65,7 +73,7 @@ layout {
         }
     }
 
-    // Export names for the Python host script to find addresses
+    // Export symbols for the Python host script
     @export_name("A", [*]f32, true);
     @export_name("B", [*]f32, true);
     @export_name("C", [*]f32, true);

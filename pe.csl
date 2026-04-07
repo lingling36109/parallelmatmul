@@ -8,14 +8,14 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const timestamp = @import_module("<time>");
 
-// Buffers for host access
+// Internal buffers
 var A: [dM * dH]f32;
 var B: [dH * dN_y]f32;
 var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
-// These pointer variables are what we actually export
+// Create pointers for exporting (to fix "@export_symbol" error)
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
@@ -32,18 +32,16 @@ var h_idx: i16 = 0;
 var n_idx: i16 = 0;
 var reduce_cnt: i16 = 0;
 
-// SENDER: Column-wise B broadcast
 task send_b_task() void {
     if (send_col >= dN_y) return;
     const out_dsd = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_color, .extent = dH, .output_queue = @get_output_queue(2) });
     const b_ptr = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH }), send_col * dH, f32);
 
-    // Synchronous move to prevent SimException/slot-overflow
+    // Synchronous move to prevent SimException
     @fmovs(out_dsd, b_ptr, .{ .activate = send_task_id });
     send_col += 1;
 }
 
-// COMPUTE: Triggers for every element arriving from the broadcast
 task recv_b_task(wavelet: f32) void {
     const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
     const a_col_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }), h_idx * dM, f32);
@@ -53,13 +51,11 @@ task recv_b_task(wavelet: f32) void {
     h_idx += 1;
     if (h_idx == dH) {
         h_idx = 0;
-        // Inject local result into the Westward reduction chain
         const out_red = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_color, .extent = dM, .output_queue = @get_output_queue(3) });
         @fmovs(out_red, red_dsd, .{ .async = true });
     }
 }
 
-// REDUCE: Accumulate partial results from the East
 task reduce_task(val: f32) void {
     C[n_idx * dM + reduce_cnt] += val;
 
@@ -67,7 +63,6 @@ task reduce_task(val: f32) void {
     if (reduce_cnt == dM) {
         reduce_cnt = 0;
         n_idx += 1;
-        // Reset partial sum buffer
         @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }), @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
         if (n_idx == dN_y) {
@@ -90,7 +85,7 @@ comptime {
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
 
-    // FIX: Export the pointers, NOT the arrays
+    // FIX: Exporting the pointers instead of the arrays
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
     @export_symbol(ptr_C, "C");
