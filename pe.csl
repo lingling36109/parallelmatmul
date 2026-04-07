@@ -52,18 +52,14 @@ const flyover_oq: output_queue = @get_output_queue(4);
 const flyover_iq: input_queue = @get_input_queue(4);
 
 // =============================================================================
-// Storage (reordered for SRAM bank-conflict avoidance)
+// Storage
 // =============================================================================
-// Place red_in immediately before A with padding to force different bank alignment.
-// WSE-2 uses word-interleaved banking: bank = (word_addr % N_banks).
-// If dM is divisible by N_banks, red_in and every A column land in the same bank
-// → reads serialize → 2 cy/element. Padding shifts A to a different bank → 1 cy/element.
-var red_in: [dM]f32 = @zeros([dM]f32);
-var _pad_bank: [1]f32 = @zeros([1]f32); // bank-alignment padding (try 1,2,3,5,7)
 var A: [dM * dH]f32 = @zeros([dM * dH]f32);
-var work_B: [dH]f32 = @zeros([dH]f32);
 var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
+
+// Per-column accumulators for h-outer (outer product) GEMV
+var accum: [dN_y * dM]f32 = @zeros([dN_y * dM]f32);
 
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
@@ -73,13 +69,9 @@ var ptr_C: [*]f32 = &C;
 var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
 const batch_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dN_y * dH });
 
-// Work buffer DSD (work_B declared above near A for locality)
-const work_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &work_B, .extent = dH });
-
 // =============================================================================
 // DSDs
 // =============================================================================
-const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
 const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 
 const zeros_buf = @zeros([dM]f32);
@@ -121,6 +113,10 @@ var my_x_val: i16 = 0;
 var my_y_val: u16 = 0;
 var my_send_start_col: i16 = 0;
 
+// Runtime loop bounds — prevents compiler unrolling (reduces instruction pressure)
+var h_limit: i16 = dH;
+var j_limit: i16 = dN_y;
+
 // Total columns to process
 const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 
@@ -130,21 +126,50 @@ const send_done_task_id: local_task_id = @get_local_task_id(12);
 const batch_done_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// Batch Done Task — process all dN_y columns, then arm next batch receive
+// Batch Done Task — h-outer (outer product) GEMV, then batched reduce
 // =============================================================================
 task batch_done_task() void {
     batch_count += 1;
 
-    // Runtime bound prevents outer loop unrolling — keeps instruction footprint small
-    // (inner GEMV loop still unrolls via comptime dH bound)
-    var cols_remaining: i16 = dN_y;
-    while (cols_remaining > 0) {
-        // Copy column from batch_B to work_B
-        const col = dN_y - cols_remaining;
-        var src = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dH });
-        src = @increment_dsd_offset(src, col * dH, f32);
-        @fmovs(work_B_dsd, src, .{});
+    // === H-outer GEMV: outer product accumulation ===
+    // For each h value, process ALL dN_y columns before moving to next h.
+    // Benefits: eliminates work_B copy, reuses A-column DSD across j iterations,
+    // different accumulators per j → no write-port contention.
 
+    // h=0: overwrite accumulators (clears + first multiply in one op)
+    {
+        const a_col_0 = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+        var j: i16 = 0;
+        while (j < j_limit) {
+            const scalar = batch_B[@as(u16, j * dH)];
+            var acc_j = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
+            acc_j = @increment_dsd_offset(acc_j, j * dM, f32);
+            @fmacs(acc_j, zeros_dsd, a_col_0, scalar);
+            j += 1;
+        }
+    }
+
+    // h=1..dH-1: accumulate
+    var h: i16 = 1;
+    while (h < h_limit) {
+        // Set up A-column DSD once per h, reused across all j
+        var a_col = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
+        a_col = @increment_dsd_offset(a_col, h * dM, f32);
+
+        var j: i16 = 0;
+        while (j < j_limit) {
+            const scalar = batch_B[@as(u16, j * dH + h)];
+            var acc_j = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
+            acc_j = @increment_dsd_offset(acc_j, j * dM, f32);
+            @fmacs(acc_j, acc_j, a_col, scalar);
+            j += 1;
+        }
+        h += 1;
+    }
+
+    // === Batched reduce — process all dN_y columns ===
+    var rj: i16 = 0;
+    while (rj < j_limit) {
         col_count += 1;
 
         // Trigger own B send at the right time
@@ -154,29 +179,9 @@ task batch_done_task() void {
             }
         }
 
-        // GEMV: h=0 overwrites red_in (eliminates separate clear)
-        {
-            const a_col_0 = @increment_dsd_offset(
-                @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
-                0, f32
-            );
-            @fmacs(red_in_dsd, zeros_dsd, a_col_0, work_B[0]);
-        }
-        // h=1..dH-1: accumulate
-        var h: i16 = 1;
-        while (h < dH) {
-            const a_col = @increment_dsd_offset(
-                @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
-                h * dM, f32
-            );
-            @fmacs(red_in_dsd, red_in_dsd, a_col, work_B[h]);
-            h += 1;
-        }
-
-        // Synchronous reduce
-        reduce();
-
-        cols_remaining -= 1;
+        // Reduce this column's accumulator
+        reduce_with_accum(rj);
+        rj += 1;
     }
 
     // Arm next batch receive if more batches expected
@@ -246,42 +251,44 @@ task send_done_task() void {
 // =============================================================================
 // Rotating Ring Reduction (Synchronous)
 // =============================================================================
-fn reduce() void {
+fn reduce_with_accum(j: i16) void {
     const my_x = my_x_val;
 
     const fsum_pe = reduce_col / dN;
     const isum_pe = (fsum_pe + 1) % kernel_x_dim;
 
+    // Build DSD for this column's accumulator
+    var acc_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
+    acc_dsd = @increment_dsd_offset(acc_dsd, j * dM, f32);
+
     var c_col_dsd = C_dsd;
     c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
 
     if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, red_in_dsd, .{});
+        @fmovs(c_col_dsd, acc_dsd, .{});
         fsum_count += 1;
     } else if (my_x == isum_pe) {
         if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, red_in_dsd, .{});
+            @fmovs(fabout_flyover, acc_dsd, .{});
         } else {
-            @fmovs(fabout_reduce, red_in_dsd, .{});
+            @fmovs(fabout_reduce, acc_dsd, .{});
         }
     } else if (my_x == fsum_pe) {
         if (my_x == 0) {
-            @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{});
+            @fadds(c_col_dsd, acc_dsd, fabin_flyover, .{});
         } else {
-            @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{});
+            @fadds(c_col_dsd, acc_dsd, fabin_reduce, .{});
         }
         fsum_count += 1;
     } else {
         if (my_x == 0) {
-            @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{});
+            @fadds(fabout_reduce, acc_dsd, fabin_flyover, .{});
         } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{});
+            @fadds(fabout_flyover, acc_dsd, fabin_reduce, .{});
         } else {
-            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{});
+            @fadds(fabout_reduce, acc_dsd, fabin_reduce, .{});
         }
     }
-
-    // red_in clear removed — first GEMV iteration overwrites via zeros_dsd
 
     reduce_col += 1;
     if (reduce_col == total_columns) {
