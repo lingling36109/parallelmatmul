@@ -45,7 +45,7 @@ layout {
                 .{ .memcpy_params = memcpy.get_params(pe_x) }
             ));
 
-            // Broadcast: North to South hardware forwarding
+            // Broadcast: North -> South (B-block distribution)
             if (pe_y == 0) {
                 @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH, RAMP} } });
             } else if (pe_y == kernel_y_dim - 1) {
@@ -54,7 +54,7 @@ layout {
                 @set_color_config(pe_x, pe_y, broadcast_color, .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } });
             }
 
-            // Reduction: East to West hardware forwarding
+            // Reduction: East -> West (C-block accumulation)
             if (pe_x == kernel_x_dim - 1) {
                 @set_color_config(pe_x, pe_y, reduce_color, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
             } else if (pe_x == 0) {

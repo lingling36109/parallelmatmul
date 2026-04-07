@@ -17,6 +17,10 @@ var C: [dM * dN]f32;
 var red_in: [dM]f32 = @zeros([dM]f32);
 const zeros_buf = @zeros([dM]f32);
 
+var ptr_A: [*]f32 = &A;
+var ptr_B: [*]f32 = &B;
+var ptr_C: [*]f32 = &C;
+
 const send_task_id: local_task_id = @get_local_task_id(11);
 const recv_task_id: data_task_id = @get_data_task_id(broadcast_color);
 const reduce_task_id: data_task_id = @get_data_task_id(reduce_color);
@@ -34,28 +38,32 @@ task send_b_task() void {
     send_col += 1;
 }
 
+// Triggers for every f32 arriving from the column broadcast
 task recv_b_task(wavelet: f32) void {
     const red_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
     const a_col_dsd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }), h_idx * dM, f32);
 
+    // High-performance Vector-Scalar MAC
     @fmacs(red_dsd, red_dsd, a_col_dsd, wavelet);
 
     h_idx += 1;
     if (h_idx == dH) {
         h_idx = 0;
+        // Broadcast finished for this column, send local partial sum West
         const out_red = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_color, .extent = dM, .output_queue = @get_output_queue(3) });
         @fmovs(out_red, red_dsd, .{ .async = true });
     }
 }
 
+// Receives partial sums from the East and accumulates
 task reduce_task(val: f32) void {
-    const my_x = layout_mod.get_x_coord();
     C[n_idx * dM + reduce_cnt] += val;
 
     reduce_cnt += 1;
     if (reduce_cnt == dM) {
         reduce_cnt = 0;
         n_idx += 1;
+        // Clear local accumulator for next column of B
         @fmovs(@get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM }), @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM }), .{});
 
         if (n_idx == dN_y) {
@@ -79,9 +87,9 @@ comptime {
     @bind_data_task(recv_b_task, recv_task_id);
     @bind_data_task(reduce_task, reduce_task_id);
 
-    @export_symbol(A);
-    @export_symbol(B);
-    @export_symbol(C);
+    @export_symbol(ptr_A, "A");
+    @export_symbol(ptr_B, "B");
+    @export_symbol(ptr_C, "C");
     @export_symbol(ptr_time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
