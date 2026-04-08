@@ -20,7 +20,6 @@ const timestamp = @import_module("<time>");
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
-var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 fn start_timer() void {
     timestamp.enable_tsc();
@@ -53,7 +52,7 @@ var C: [dM * dN]f32 = @zeros([dM * dN]f32);
 var red_in: [dM]f32 = @zeros([dM]f32);
 var buf_B: [dH]f32 = @zeros([dH]f32);
 
-// Constant buffer for resets
+// Constant buffer for resets to ensure stable DSD addresses
 var zeros_buf = @zeros([dM]f32);
 
 // DSDs
@@ -85,8 +84,7 @@ fn receive_next_column() void {
 
 task column_done_task() void {
     col_count += 1;
-
-    // Fixed: changed && to and
+    // Fix: replaced && with 'and'
     if (col_count == my_send_start_col + 1 and my_y_val != 0) {
         @activate(send_task_id);
     }
@@ -171,9 +169,11 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(column_done_task, column_done_id);
     @bind_local_task(reduce_done_task, reduce_done_task_id);
-    @export_symbol(&A, "A");
-    @export_symbol(&B, "B");
-    @export_symbol(&C, "C");
-    @export_symbol(&time_buf_u16, "time_buf_u16");
+
+    // Fix: Removed '&' from symbol exports
+    @export_symbol(A, "A");
+    @export_symbol(B, "B");
+    @export_symbol(C, "C");
+    @export_symbol(time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
