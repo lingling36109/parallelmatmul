@@ -152,18 +152,48 @@ task column_done_task() void {
 // Reduce Done Task - Callback
 // =============================================================================
 task reduce_done_task() void {
-    const fsum_pe = reduce_col / dN;
-    if (my_x_val == fsum_pe) {
-        fsum_count += 1;
-    }
-
-    // Zero out red_in for the next accumulation
-    @fmovs(red_in_dsd, zeros_dsd, .{});
-
     reduce_col += 1;
     if (reduce_col == total_columns) {
         terminate_kernel();
     }
+}
+
+// Phase 1: Broadcast Send (Synchronous to save microthread slots)
+task send_task() void {
+    // Making this synchronous is key for stability and cycle efficiency
+    @fmovs(out_dsd, b_dsd, .{ .activate = send_done_task_id });
+}
+
+// Phase 2 & 3: Reduction and Scatter
+task do_reduce() void {
+    if (kernel_x_dim == 1) {
+        // Single PE case: Move partial sum to result and finish
+        @fmovs(res_dsd, red_in_dsd, .{ .activate = reduce_done_task_id });
+    } else {
+        if (my_x == 0) {
+            // REDUCE START: Send local sum East
+            @fmovs(fabout_reduce, red_in_dsd, .{ .async = true });
+            // SCATTER END: Receive final result from West
+            @fmovs(res_dsd, fabin_flyover, .{ .async = true, .activate = reduce_done_task_id });
+
+        } else if (my_x == kernel_x_dim - 1) {
+            // REDUCE END: Receive from West + Add Local
+            @fadds(res_dsd, red_in_dsd, fabin_reduce, .{ .async = true });
+            // SCATTER START: Send final result back West
+            @fmovs(fabout_flyover, res_dsd, .{ .async = true, .activate = reduce_done_task_id });
+
+        } else {
+            // MIDDLE PE:
+            // 1. Accumulate reduction (West + Local) and forward East
+            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{ .async = true });
+            // 2. Receive scatter (from East) and forward West + Store locally
+            @fmovs(res_dsd, fabin_flyover, .{ .async = true });
+            @fmovs(fabout_flyover, res_dsd, .{ .async = true, .activate = reduce_done_task_id });
+        }
+    }
+
+    // Reset local partial sum accumulator for the next column of B
+    @fmovs(red_in_dsd, zeros_dsd, .{});
 }
 
 // =============================================================================
