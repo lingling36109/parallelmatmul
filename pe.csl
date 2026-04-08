@@ -58,43 +58,30 @@ var A: [dM * dH]f32 = @zeros([dM * dH]f32);
 var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
 
-// Per-column working buffers
-var red_in: [dM]f32 = @zeros([dM]f32);
-var work_B: [dH]f32 = @zeros([dH]f32);
-
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
+var red_in: [dM]f32 = @zeros([dM]f32);
+
+// B-column receive buffer for DSD streaming
+var buf_B: [dH]f32 = @zeros([dH]f32);
+const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
+
 // =============================================================================
 // DSDs
 // =============================================================================
-const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
-const work_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &work_B, .extent = dH });
+const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
 
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
-// Per-column fabric receive (dH wavelets per column)
-const fabin_col = @get_dsd(fabin_dsd, .{
+// DSD for streaming receive from broadcast fabric
+const fabin_broadcast = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_rx_color,
     .extent = dH,
     .input_queue = broadcast_iq,
-});
-
-// Pre-computed fabric DSDs for reduce
-const fabin_reduce = @get_dsd(fabin_dsd, .{
-    .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
-});
-const fabin_flyover = @get_dsd(fabin_dsd, .{
-    .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
-});
-const fabout_reduce = @get_dsd(fabout_dsd, .{
-    .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
-});
-const fabout_flyover = @get_dsd(fabout_dsd, .{
-    .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
 });
 
 // =============================================================================
@@ -117,42 +104,49 @@ const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
-const col_done_id: local_task_id = @get_local_task_id(13);
+const column_done_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// Column Done Task — comptime-unrolled GEMV + reduce
+// DSD Streaming Receive — hardware-speed column reception
 // =============================================================================
-task col_done_task() void {
+fn receive_next_column() void {
+    // Stream dH wavelets from fabric into buf_B at ~1 cycle/element
+    // No per-wavelet task overhead — pure hardware transfer
+    @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
+}
+
+// =============================================================================
+// Column Done Task — GEMV + reduce after full column received
+// =============================================================================
+task column_done_task() void {
     col_count += 1;
 
-    // Trigger own B send at the right time
+    // Check if we should trigger own B send
     if (!has_sent) {
         if (col_count >= my_send_start_col) {
             @activate(send_task_id);
         }
     }
 
-    // Comptime-unrolled GEMV (dH @fmacs, zero loop overhead)
+    // Batched GEMV: red_in += A * buf_B
+    // Compiler unrolls with --max-inlined-iterations 150
     var h: i16 = 0;
     while (h < dH) {
-        const scalar = work_B[h];
-        var a_col = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-        a_col = @increment_dsd_offset(a_col, h * dM, f32);
-        if (h == 0) {
-            @fmacs(red_in_dsd, zeros_dsd, a_col, scalar);
-        } else {
-            @fmacs(red_in_dsd, red_in_dsd, a_col, scalar);
-        }
+        const a_col = @increment_dsd_offset(
+            @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
+            h * dM, f32
+        );
+        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B[h]);
         h += 1;
     }
 
-    // Arm next receive BEFORE reduce (32 wavelets arrive during 96cy reduce)
-    if (col_count < total_columns) {
-        @fmovs(work_B_dsd, fabin_col, .{ .async = true, .activate = col_done_id });
-    }
+    // Synchronous reduce — provides flow control via fabric backpressure
+    reduce();
 
-    // Synchronous reduce
-    reduce_column();
+    // Arm next column receive if more columns expected
+    if (reduce_col < total_columns) {
+        receive_next_column();
+    }
 }
 
 // =============================================================================
@@ -170,6 +164,8 @@ fn setup_relay() void {
         .extent = total_upstream,
         .output_queue = broadcast_oq,
     });
+    // Relay all upstream wavelets at hardware speed (~1 cycle each)
+    // Runs on separate microthread, concurrent with receive/compute
     @fmovs(fabout_rx, fabin_tx, .{ .async = true });
 }
 
@@ -209,6 +205,7 @@ task send_done_task() void {
     if (send_col < dN_y) {
         send_next_column();
     } else if (my_y_val == 0) {
+        // All own columns sent — start bulk relay for upstream PEs
         setup_relay();
     }
 }
@@ -216,7 +213,7 @@ task send_done_task() void {
 // =============================================================================
 // Rotating Ring Reduction (Synchronous)
 // =============================================================================
-fn reduce_column() void {
+fn reduce() void {
     const my_x = my_x_val;
 
     const fsum_pe = reduce_col / dN;
@@ -224,6 +221,19 @@ fn reduce_column() void {
 
     var c_col_dsd = C_dsd;
     c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
+
+    const fabin_reduce = @get_dsd(fabin_dsd, .{
+        .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
+    });
+    const fabin_flyover = @get_dsd(fabin_dsd, .{
+        .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
+    });
+    const fabout_reduce = @get_dsd(fabout_dsd, .{
+        .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
+    });
+    const fabout_flyover = @get_dsd(fabout_dsd, .{
+        .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
+    });
 
     if (kernel_x_dim == 1) {
         @fmovs(c_col_dsd, red_in_dsd, .{});
@@ -251,6 +261,8 @@ fn reduce_column() void {
         }
     }
 
+    @fmovs(red_in_dsd, zeros_dsd, .{});
+
     reduce_col += 1;
     if (reduce_col == total_columns) {
         terminate_kernel();
@@ -267,8 +279,8 @@ fn broadcast_pe() void {
     my_x_val = @as(i16, layout_mod.get_x_coord());
     my_send_start_col = @as(i16, my_y_val) * dN_y;
 
-    // Arm first column receive (dH wavelets)
-    @fmovs(work_B_dsd, fabin_col, .{ .async = true, .activate = col_done_id });
+    // Start DSD streaming receive for first B column
+    receive_next_column();
 
     if (my_y_val == 0) {
         @activate(send_task_id);
@@ -283,9 +295,10 @@ fn terminate_kernel() void {
 comptime {
     @comptime_assert(@is_arch("wse2"));
 
+    // No data task bindings — using DSD streaming instead
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
-    @bind_local_task(col_done_task, col_done_id);
+    @bind_local_task(column_done_task, column_done_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
