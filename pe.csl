@@ -58,33 +58,32 @@ var A: [dM * dH]f32 = @zeros([dM * dH]f32);
 var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
 var C: [dM * dN]f32 = @zeros([dM * dN]f32);
 
-// Per-column accumulators for h-outer (outer product) GEMV
-var accum: [dN_y * dM]f32 = @zeros([dN_y * dM]f32);
+// Per-column working buffers
+var red_in: [dM]f32 = @zeros([dM]f32);
+var work_B: [dH]f32 = @zeros([dH]f32);
 
 var ptr_A: [*]f32 = &A;
 var ptr_B: [*]f32 = &B;
 var ptr_C: [*]f32 = &C;
 
-// Batch receive buffer — holds dN_y columns (one sending PE's worth)
-var batch_B: [dN_y * dH]f32 = @zeros([dN_y * dH]f32);
-const batch_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &batch_B, .extent = dN_y * dH });
-
 // =============================================================================
 // DSDs
 // =============================================================================
 const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
+const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
+const work_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &work_B, .extent = dH });
 
 const zeros_buf = @zeros([dM]f32);
 const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
-// DSD for batch streaming receive from broadcast fabric
-const fabin_batch = @get_dsd(fabin_dsd, .{
+// Per-column fabric receive (dH wavelets per column)
+const fabin_col = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_rx_color,
-    .extent = dN_y * dH,
+    .extent = dH,
     .input_queue = broadcast_iq,
 });
 
-// Pre-computed fabric DSDs for reduce (constant across all calls)
+// Pre-computed fabric DSDs for reduce
 const fabin_reduce = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
 });
@@ -106,16 +105,11 @@ var fsum_count: i16 = 0;
 var col_count: i16 = 0;
 var has_sent: bool = false;
 var send_col: i16 = 0;
-var batch_count: i16 = 0;
 
 // Pre-computed values (set in broadcast_pe)
 var my_x_val: i16 = 0;
 var my_y_val: u16 = 0;
 var my_send_start_col: i16 = 0;
-
-// Runtime loop bounds — prevents compiler unrolling (reduces instruction pressure)
-var h_limit: i16 = dH;
-var j_limit: i16 = dN_y;
 
 // Total columns to process
 const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
@@ -123,66 +117,42 @@ const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
-const batch_done_id: local_task_id = @get_local_task_id(13);
+const col_done_id: local_task_id = @get_local_task_id(13);
 
 // =============================================================================
-// Batch Done Task — h-outer (outer product) GEMV, then batched reduce
+// Column Done Task — comptime-unrolled GEMV + reduce
 // =============================================================================
-task batch_done_task() void {
-    batch_count += 1;
+task col_done_task() void {
+    col_count += 1;
 
-    // === H-outer GEMV: outer product accumulation ===
-    // For each h value, process ALL dN_y columns before moving to next h.
-    // Benefits: eliminates work_B copy, reuses A-column DSD across j iterations,
-    // different accumulators per j → no write-port contention.
+    // Trigger own B send at the right time
+    if (!has_sent) {
+        if (col_count >= my_send_start_col) {
+            @activate(send_task_id);
+        }
+    }
+
+    // Comptime-unrolled GEMV (dH @fmacs, zero loop overhead)
     var h: i16 = 0;
-    while (h < h_limit) {
-        // Set up A-column DSD once per h, reused across all j
+    while (h < dH) {
+        const scalar = work_B[h];
         var a_col = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
         a_col = @increment_dsd_offset(a_col, h * dM, f32);
-
-        var j: i16 = 0;
-        while (j < j_limit) {
-            // Read scalar directly from batch_B — no copy needed
-            const scalar = batch_B[@as(u16, j * dH + h)];
-
-            // Build accumulator DSD for column j
-            var acc_j = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
-            acc_j = @increment_dsd_offset(acc_j, j * dM, f32);
-
-            if (h == 0) {
-                // h=0: overwrite (clear + multiply in one op)
-                @fmacs(acc_j, zeros_dsd, a_col, scalar);
-            } else {
-                // h>0: accumulate
-                @fmacs(acc_j, acc_j, a_col, scalar);
-            }
-            j += 1;
+        if (h == 0) {
+            @fmacs(red_in_dsd, zeros_dsd, a_col, scalar);
+        } else {
+            @fmacs(red_in_dsd, red_in_dsd, a_col, scalar);
         }
         h += 1;
     }
 
-    // === Batched reduce — process all dN_y columns ===
-    var rj: i16 = 0;
-    while (rj < j_limit) {
-        col_count += 1;
-
-        // Trigger own B send at the right time
-        if (!has_sent) {
-            if (col_count >= my_send_start_col) {
-                @activate(send_task_id);
-            }
-        }
-
-        // Reduce this column's accumulator
-        reduce_with_accum(rj);
-        rj += 1;
+    // Arm next receive BEFORE reduce (32 wavelets arrive during 96cy reduce)
+    if (col_count < total_columns) {
+        @fmovs(work_B_dsd, fabin_col, .{ .async = true, .activate = col_done_id });
     }
 
-    // Arm next batch receive if more batches expected
-    if (batch_count < kernel_y_dim) {
-        @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
-    }
+    // Synchronous reduce
+    reduce_column();
 }
 
 // =============================================================================
@@ -246,42 +216,38 @@ task send_done_task() void {
 // =============================================================================
 // Rotating Ring Reduction (Synchronous)
 // =============================================================================
-fn reduce_with_accum(j: i16) void {
+fn reduce_column() void {
     const my_x = my_x_val;
 
     const fsum_pe = reduce_col / dN;
     const isum_pe = (fsum_pe + 1) % kernel_x_dim;
 
-    // Build DSD for this column's accumulator
-    var acc_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &accum, .extent = dM });
-    acc_dsd = @increment_dsd_offset(acc_dsd, j * dM, f32);
-
     var c_col_dsd = C_dsd;
     c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
 
     if (kernel_x_dim == 1) {
-        @fmovs(c_col_dsd, acc_dsd, .{});
+        @fmovs(c_col_dsd, red_in_dsd, .{});
         fsum_count += 1;
     } else if (my_x == isum_pe) {
         if (my_x == kernel_x_dim - 1) {
-            @fmovs(fabout_flyover, acc_dsd, .{});
+            @fmovs(fabout_flyover, red_in_dsd, .{});
         } else {
-            @fmovs(fabout_reduce, acc_dsd, .{});
+            @fmovs(fabout_reduce, red_in_dsd, .{});
         }
     } else if (my_x == fsum_pe) {
         if (my_x == 0) {
-            @fadds(c_col_dsd, acc_dsd, fabin_flyover, .{});
+            @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{});
         } else {
-            @fadds(c_col_dsd, acc_dsd, fabin_reduce, .{});
+            @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{});
         }
         fsum_count += 1;
     } else {
         if (my_x == 0) {
-            @fadds(fabout_reduce, acc_dsd, fabin_flyover, .{});
+            @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{});
         } else if (my_x == kernel_x_dim - 1) {
-            @fadds(fabout_flyover, acc_dsd, fabin_reduce, .{});
+            @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{});
         } else {
-            @fadds(fabout_reduce, acc_dsd, fabin_reduce, .{});
+            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{});
         }
     }
 
@@ -301,8 +267,8 @@ fn broadcast_pe() void {
     my_x_val = @as(i16, layout_mod.get_x_coord());
     my_send_start_col = @as(i16, my_y_val) * dN_y;
 
-    // Arm batch 0 receive (dN_y * dH wavelets from first sending PE)
-    @fmovs(batch_B_dsd, fabin_batch, .{ .async = true, .activate = batch_done_id });
+    // Arm first column receive (dH wavelets)
+    @fmovs(work_B_dsd, fabin_col, .{ .async = true, .activate = col_done_id });
 
     if (my_y_val == 0) {
         @activate(send_task_id);
@@ -319,7 +285,7 @@ comptime {
 
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
-    @bind_local_task(batch_done_task, batch_done_id);
+    @bind_local_task(col_done_task, col_done_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
