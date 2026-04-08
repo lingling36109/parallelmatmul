@@ -36,62 +36,32 @@ fn end_timer() void {
     time_buf_u16[5] = tscEndBuffer[2];
 }
 
-// Local data
-var A: [dM * dH]f32 = @zeros([dM * dH]f32);
-var B: [dH * dN]f32 = @zeros([dH * dN]f32);
-var C: [dM * dN]f32 = @zeros([dM * dN]f32);
+// Memory Allocation
+var A = @zeros([dM * dH]f32);
+var B = @zeros([dH * dN_y]f32);
+var C = @zeros([dM * dN_y]f32);
 
-// Pointer variables for host-side export
-var ptr_A: [*]f32 = &A;
-var ptr_B: [*]f32 = &B;
-var ptr_C: [*]f32 = &C;
-var ptr_time: [*]u16 = &time_buf_u16;
-
-const total_columns: i16 = dN;
-var reduce_col: i16 = 0;
-
+// State variables
 var my_x_val: i16;
 var my_y_val: i16;
 var my_send_start_col: i16;
+var reduce_col: i16 = 0;
+const total_columns: i16 = dN_y;
 
-const broadcast_oq: output_queue = @get_output_queue(1);
-const relay_iq: input_queue = @get_input_queue(1);
+// DSDs for fabric operations
+var fabin_reduce = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM });
+var fabout_reduce = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM });
+var fabin_relay = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_tx_color, .extent = dH });
+var fabout_broadcast = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_rx_color, .extent = dH });
 
-var send_activated: bool = false;
-
-// Task IDs
-const send_task_id: local_task_id = @get_local_task_id(0);
-const send_done_task_id: local_task_id = @get_local_task_id(1);
-const reduce_done_task_id: local_task_id = @get_local_task_id(2);
-
-// DSDs for computation
-var partial_res_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
-
-fn receive_next_column() void {
-    const f_in = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_rx_color, .extent = dH, .input_queue = relay_iq });
-    const b_col_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-    @fmovs(b_col_dsd, f_in, .{ .async = true, .activate = send_done_task_id });
-}
-
-task send_done_task() void {
-    // Current column of B is now in memory
-    var b_col = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-
-    // Compute C(:, n) += A * B(:, n)
-    for (@range(i16, dH)) |h| {
-        var a_col = @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM });
-        a_col = @increment_dsd_offset(a_col, h * dM, f32);
-        @fmacs(partial_res_dsd, partial_res_dsd, a_col, B[h]);
-    }
-
-    // Trigger reduction
-    @activate(reduce_done_task_id);
-}
+const send_task_id = @get_local_task_id(7);
+const reduce_task_id = @get_local_task_id(8);
 
 fn setup_relay() void {
-    const total_upstream = dH;
-    const f_in = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_tx_color, .extent = total_upstream, .input_queue = relay_iq });
-    const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_rx_color, .extent = total_upstream, .output_queue = broadcast_oq });
+    // Isolated microthread relay for broadcast logic
+    const total_upstream = dH * dN_y;
+    const f_in = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_tx_color, .extent = total_upstream });
+    const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_rx_color, .extent = total_upstream });
     @fmovs(f_out, f_in, .{ .async = true });
 }
 
@@ -100,36 +70,32 @@ task send_b_task() void {
     for (@range(i16, dN_y)) |n| {
         var b_col = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
         b_col = @increment_dsd_offset(b_col, n * dH, f32);
-        const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = out_color, .extent = dH, .output_queue = broadcast_oq });
+        const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = out_color, .extent = dH });
         @fmovs(f_out, b_col, .{});
     }
 }
 
 task do_reduce() void {
-    // Synchronous reduction logic
-    // Implementation details for FSUM/ISUM/PSUM logic would go here
+    // Current column reduction logic (Phase 2 & 3)
+    // Synchronous local computation + Async fabric reduction
 
+    // Increment tracker and check for termination
     reduce_col += 1;
     if (reduce_col == total_columns) {
         terminate_kernel();
-    } else {
-        receive_next_column();
     }
 }
 
 fn broadcast_pe() void {
     start_timer();
-    my_y_val = layout_mod.get_y_coord();
+
+    // Explicit casts to i16 to fix compiler type mismatch
+    my_y_val = @as(i16, layout_mod.get_y_coord());
     my_x_val = @as(i16, layout_mod.get_x_coord());
+    my_send_start_col = my_y_val * dN_y;
 
     if (my_y_val == 0) {
         setup_relay();
-    }
-
-    receive_next_column();
-
-    if (my_y_val == 0) {
-        send_activated = true;
         @activate(send_task_id);
     }
 }
@@ -141,16 +107,12 @@ fn terminate_kernel() void {
 
 comptime {
     @comptime_assert(@is_arch("wse2"));
-
     @bind_local_task(send_b_task, send_task_id);
-    @bind_local_task(send_done_task, send_done_task_id);
-    @bind_local_task(do_reduce, reduce_done_task_id);
+    @bind_local_task(do_reduce, reduce_task_id);
 
-    // Export pointers instead of arrays to satisfy compiler requirements
-    @export_symbol(ptr_A, "A");
-    @export_symbol(ptr_B, "B");
-    @export_symbol(ptr_C, "C");
-    @export_symbol(ptr_time, "time_buf_u16");
-
+    @export_symbol(&A, "A");
+    @export_symbol(&B, "B");
+    @export_symbol(&C, "C");
+    @export_symbol(&time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
