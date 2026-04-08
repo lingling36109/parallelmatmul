@@ -66,7 +66,6 @@ var red_in: [dM]f32 = @zeros([dM]f32);
 
 // B-column receive buffer for DSD streaming
 var buf_B: [dH]f32 = @zeros([dH]f32);
-
 const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
 
 // =============================================================================
@@ -92,22 +91,21 @@ var reduce_col: i16 = 0;
 var fsum_count: i16 = 0;
 var col_count: i16 = 0;
 
-var has_sent: bool = false;
+var send_activated: bool = false;
 var send_col: i16 = 0;
 
-// Pre-computed values (set in broadcast_pe)
+// Pre-computed values
 var my_x_val: i16 = 0;
 var my_y_val: u16 = 0;
 var my_send_start_col: i16 = 0;
 
-// Total columns to process
 const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 
 // Task IDs
 const send_task_id: local_task_id = @get_local_task_id(11);
 const send_done_task_id: local_task_id = @get_local_task_id(12);
 const column_done_id: local_task_id = @get_local_task_id(13);
-const reduce_done_task_id: local_task_id = @get_local_task_id(14); // Added Callback ID
+const reduce_done_task_id: local_task_id = @get_local_task_id(14);
 
 // =============================================================================
 // DSD Streaming Receive
@@ -122,9 +120,10 @@ fn receive_next_column() void {
 task column_done_task() void {
     col_count += 1;
 
-    // Check if we should trigger own B send
-    if (!has_sent) {
+    // Trigger own B send safely with an activation flag
+    if (!send_activated) {
         if (col_count >= my_send_start_col) {
+            send_activated = true;
             @activate(send_task_id);
         }
     }
@@ -140,6 +139,11 @@ task column_done_task() void {
         h += 1;
     }
 
+    // Pipelining: Arm next column receive IMMEDIATELY to prevent sender backpressure
+    if (col_count < total_columns) {
+        receive_next_column();
+    }
+
     // Asynchronous reduce - allows CE to continue functioning
     reduce();
 }
@@ -153,20 +157,17 @@ task reduce_done_task() void {
         fsum_count += 1;
     }
 
-    // Zero out red_in for the next accumulation safely
+    // Zero out red_in for the next accumulation
     @fmovs(red_in_dsd, zeros_dsd, .{});
 
     reduce_col += 1;
     if (reduce_col == total_columns) {
         terminate_kernel();
-    } else {
-        // Arm next column receive strictly after previous reduction resolves
-        receive_next_column();
     }
 }
 
 // =============================================================================
-// DSD Streaming Relay
+// Hardware-Speed Relay (Launched once at initialization)
 // =============================================================================
 fn setup_relay() void {
     const total_upstream = @as(u16, (@as(i16, kernel_y_dim) - 1) * dH * dN_y);
@@ -188,7 +189,6 @@ fn setup_relay() void {
 // Send B Data
 // =============================================================================
 task send_b_task() void {
-    has_sent = true;
     send_col = 0;
     send_next_column();
 }
@@ -200,7 +200,7 @@ fn send_next_column() void {
     var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
     b_dsd = @increment_dsd_offset(b_dsd, offset, f32);
 
-    // Synchronous Send: Eliminates microthread contention on local routing
+    // Synchronous Send keeps microthreads free, relies on pipelined receives to stay unblocked
     if (my_y_val == 0) {
         const out_dsd = @get_dsd(fabout_dsd, .{
             .fabric_color = broadcast_rx_color,
@@ -217,7 +217,6 @@ fn send_next_column() void {
         @fmovs(out_dsd, b_dsd, .{});
     }
 
-    // Defer the next column send to keep the CE interleaved and unblocked
     @activate(send_done_task_id);
 }
 
@@ -225,9 +224,6 @@ task send_done_task() void {
     send_col += 1;
     if (send_col < dN_y) {
         send_next_column();
-    } else if (my_y_val == 0) {
-        // All own columns sent — start bulk relay for upstream PEs
-        setup_relay();
     }
 }
 
@@ -255,7 +251,6 @@ fn reduce() void {
         .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
     });
 
-    // Fire operations asynchronously to the background and trigger callback
     if (kernel_x_dim == 1) {
         @fmovs(c_col_dsd, red_in_dsd, .{ .async = true, .activate = reduce_done_task_id });
     } else if (my_x == isum_pe) {
@@ -291,10 +286,16 @@ fn broadcast_pe() void {
     my_x_val = @as(i16, layout_mod.get_x_coord());
     my_send_start_col = @as(i16, my_y_val) * dN_y;
 
+    if (my_y_val == 0) {
+        // Initializes the hardware relay immediately to guarantee isolated microthread mapping
+        setup_relay();
+    }
+
     // Start DSD streaming receive for first B column
     receive_next_column();
 
     if (my_y_val == 0) {
+        send_activated = true;
         @activate(send_task_id);
     }
 }
@@ -310,7 +311,7 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(send_done_task, send_done_task_id);
     @bind_local_task(column_done_task, column_done_id);
-    @bind_local_task(reduce_done_task, reduce_done_task_id); // Bound new task
+    @bind_local_task(reduce_done_task, reduce_done_task_id);
 
     @export_symbol(ptr_A, "A");
     @export_symbol(ptr_B, "B");
