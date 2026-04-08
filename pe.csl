@@ -53,10 +53,13 @@ var C: [dM * dN]f32 = @zeros([dM * dN]f32);
 var red_in: [dM]f32 = @zeros([dM]f32);
 var buf_B: [dH]f32 = @zeros([dH]f32);
 
+// Constant buffer for resets
+var zeros_buf = @zeros([dM]f32);
+
 // DSDs
 const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
 const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
-const zeros_dsd  = @get_dsd(mem1d_dsd, .{ .base_address = @zeros([dM]f32), .extent = dM });
+const zeros_dsd  = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
 
 const fabin_broadcast = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_rx_color, .extent = dH, .input_queue = broadcast_iq,
@@ -82,7 +85,9 @@ fn receive_next_column() void {
 
 task column_done_task() void {
     col_count += 1;
-    if (col_count == my_send_start_col + 1 && my_y_val != 0) {
+
+    // Fixed: changed && to and
+    if (col_count == my_send_start_col + 1 and my_y_val != 0) {
         @activate(send_task_id);
     }
 
@@ -97,7 +102,6 @@ task column_done_task() void {
 }
 
 task reduce_done_task() void {
-    // Reset local partial sum ONLY after reduction is safely in fabric/memory
     @fmovs(red_in_dsd, zeros_dsd, .{});
     reduce_col += 1;
     if (reduce_col == total_columns) { terminate_kernel(); }
@@ -118,11 +122,9 @@ fn reduce() void {
         @fmovs(fabout_red, red_in_dsd, .{ .async = true });
         @fmovs(c_col_dsd, fabin_fly, .{ .async = true, .activate = reduce_done_task_id });
     } else if (my_x_val == kernel_x_dim - 1) {
-        // Final PE accumulates and starts the scatter back West
         @fadds(fabout_fly, red_in_dsd, fabin_red, .{ .async = true });
         @fadds(c_col_dsd, red_in_dsd, fabin_red, .{ .async = true, .activate = reduce_done_task_id });
     } else {
-        // Middle PEs: Forward reduction East, then forward scatter West
         @fadds(fabout_red, red_in_dsd, fabin_red, .{ .async = true });
         @fmovs(fabout_fly, fabin_fly, .{ .async = true });
         @fmovs(c_col_dsd, fabin_fly, .{ .async = true, .activate = reduce_done_task_id });
@@ -142,7 +144,7 @@ task send_b_task() void {
         var b_col = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
         b_col = @increment_dsd_offset(b_col, n * dH, f32);
         const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = out_color, .extent = dH, .output_queue = broadcast_oq });
-        @fmovs(f_out, b_col, .{}); // Synchronous send to save microthreads
+        @fmovs(f_out, b_col, .{});
     }
 }
 
@@ -169,7 +171,9 @@ comptime {
     @bind_local_task(send_b_task, send_task_id);
     @bind_local_task(column_done_task, column_done_id);
     @bind_local_task(reduce_done_task, reduce_done_task_id);
-    @export_symbol(&A, "A"); @export_symbol(&B, "B"); @export_symbol(&C, "C");
-    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
+    @export_symbol(&A, "A");
+    @export_symbol(&B, "B");
+    @export_symbol(&C, "C");
+    @export_symbol(&time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
