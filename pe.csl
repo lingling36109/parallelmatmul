@@ -20,82 +20,269 @@ const timestamp = @import_module("<time>");
 var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 var time_buf_u16 = @zeros([timestamp.tsc_size_words * 2]u16);
+var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
 
 fn start_timer() void {
     timestamp.enable_tsc();
     timestamp.get_timestamp(&tscStartBuffer);
+    time_buf_u16[0] = tscStartBuffer[0];
+    time_buf_u16[1] = tscStartBuffer[1];
+    time_buf_u16[2] = tscStartBuffer[2];
 }
 
 fn end_timer() void {
     timestamp.get_timestamp(&tscEndBuffer);
-    time_buf_u16[0] = tscStartBuffer[0];
-    time_buf_u16[1] = tscStartBuffer[1];
-    time_buf_u16[2] = tscStartBuffer[2];
     time_buf_u16[3] = tscEndBuffer[0];
     time_buf_u16[4] = tscEndBuffer[1];
     time_buf_u16[5] = tscEndBuffer[2];
 }
 
-// Memory Allocation
-var A = @zeros([dM * dH]f32);
-var B = @zeros([dH * dN_y]f32);
-var C = @zeros([dM * dN_y]f32);
+// =============================================================================
+// Queue declarations
+// =============================================================================
+const broadcast_oq: output_queue = @get_output_queue(2);
+const broadcast_iq: input_queue = @get_input_queue(3);
+const relay_iq: input_queue = @get_input_queue(5);
 
+const reduce_oq: output_queue = @get_output_queue(3);
+const reduce_iq: input_queue = @get_input_queue(2);
+
+const flyover_color: color = scatter_color;
+const flyover_oq: output_queue = @get_output_queue(4);
+const flyover_iq: input_queue = @get_input_queue(4);
+
+// =============================================================================
+// Storage
+// =============================================================================
+var A: [dM * dH]f32 = @zeros([dM * dH]f32);
+var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
+var C: [dM * dN]f32 = @zeros([dM * dN]f32);
+
+var ptr_A: [*]f32 = &A;
+var ptr_B: [*]f32 = &B;
+var ptr_C: [*]f32 = &C;
+
+var red_in: [dM]f32 = @zeros([dM]f32);
+
+// B-column receive buffer for DSD streaming
+var buf_B: [dH]f32 = @zeros([dH]f32);
+const buf_B_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &buf_B, .extent = dH });
+
+// =============================================================================
+// DSDs
+// =============================================================================
+const red_in_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &red_in, .extent = dM });
+const C_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &C, .extent = dM });
+
+const zeros_buf = @zeros([dM]f32);
+const zeros_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &zeros_buf, .extent = dM });
+
+// DSD for streaming receive from broadcast fabric
+const fabin_broadcast = @get_dsd(fabin_dsd, .{
+    .fabric_color = broadcast_rx_color,
+    .extent = dH,
+    .input_queue = broadcast_iq,
+});
+
+// =============================================================================
 // State variables
-var my_x_val: i16;
-var my_y_val: i16;
-var my_send_start_col: i16;
+// =============================================================================
 var reduce_col: i16 = 0;
-const total_columns: i16 = dN_y;
+var fsum_count: i16 = 0;
+var col_count: i16 = 0;
+var has_sent: bool = false;
+var send_col: i16 = 0;
 
-// DSDs for fabric operations
-var fabin_reduce = @get_dsd(fabin_dsd, .{ .fabric_color = reduce_rx_color, .extent = dM });
-var fabout_reduce = @get_dsd(fabout_dsd, .{ .fabric_color = reduce_tx_color, .extent = dM });
-var fabin_relay = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_tx_color, .extent = dH });
-var fabout_broadcast = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_rx_color, .extent = dH });
+// Pre-computed values (set in broadcast_pe)
+var my_x_val: i16 = 0;
+var my_y_val: u16 = 0;
+var my_send_start_col: i16 = 0;
 
-const send_task_id = @get_local_task_id(7);
-const reduce_task_id = @get_local_task_id(8);
+// Total columns to process
+const total_columns: i16 = @as(i16, kernel_y_dim) * dN_y;
 
-fn setup_relay() void {
-    // Isolated microthread relay for broadcast logic
-    const total_upstream = dH * dN_y;
-    const f_in = @get_dsd(fabin_dsd, .{ .fabric_color = broadcast_tx_color, .extent = total_upstream });
-    const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = broadcast_rx_color, .extent = total_upstream });
-    @fmovs(f_out, f_in, .{ .async = true });
+// Task IDs
+const send_task_id: local_task_id = @get_local_task_id(11);
+const send_done_task_id: local_task_id = @get_local_task_id(12);
+const column_done_id: local_task_id = @get_local_task_id(13);
+
+// =============================================================================
+// DSD Streaming Receive — hardware-speed column reception
+// =============================================================================
+fn receive_next_column() void {
+    // Stream dH wavelets from fabric into buf_B at ~1 cycle/element
+    // No per-wavelet task overhead — pure hardware transfer
+    @fmovs(buf_B_dsd, fabin_broadcast, .{ .async = true, .activate = column_done_id });
 }
 
-task send_b_task() void {
-    const out_color = if (my_y_val == 0) broadcast_rx_color else broadcast_tx_color;
-    for (@range(i16, dN_y)) |n| {
-        var b_col = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
-        b_col = @increment_dsd_offset(b_col, n * dH, f32);
-        const f_out = @get_dsd(fabout_dsd, .{ .fabric_color = out_color, .extent = dH });
-        @fmovs(f_out, b_col, .{});
+// =============================================================================
+// Column Done Task — GEMV + reduce after full column received
+// =============================================================================
+task column_done_task() void {
+    col_count += 1;
+
+    // Check if we should trigger own B send
+    if (!has_sent) {
+        if (col_count >= my_send_start_col) {
+            @activate(send_task_id);
+        }
+    }
+
+    // Batched GEMV: red_in += A * buf_B
+    // Compiler unrolls with --max-inlined-iterations 150
+    var h: i16 = 0;
+    while (h < dH) {
+        const a_col = @increment_dsd_offset(
+            @get_dsd(mem1d_dsd, .{ .base_address = &A, .extent = dM }),
+            h * dM, f32
+        );
+        @fmacs(red_in_dsd, red_in_dsd, a_col, buf_B[h]);
+        h += 1;
+    }
+
+    // Synchronous reduce — provides flow control via fabric backpressure
+    reduce();
+
+    // Arm next column receive if more columns expected
+    if (reduce_col < total_columns) {
+        receive_next_column();
     }
 }
 
-task do_reduce() void {
-    // Current column reduction logic (Phase 2 & 3)
-    // Synchronous local computation + Async fabric reduction
+// =============================================================================
+// DSD Streaming Relay — hardware-speed bulk relay at y=0
+// =============================================================================
+fn setup_relay() void {
+    const total_upstream = @as(u16, (@as(i16, kernel_y_dim) - 1) * dH * dN_y);
+    const fabin_tx = @get_dsd(fabin_dsd, .{
+        .fabric_color = broadcast_tx_color,
+        .extent = total_upstream,
+        .input_queue = relay_iq,
+    });
+    const fabout_rx = @get_dsd(fabout_dsd, .{
+        .fabric_color = broadcast_rx_color,
+        .extent = total_upstream,
+        .output_queue = broadcast_oq,
+    });
+    // Relay all upstream wavelets at hardware speed (~1 cycle each)
+    // Runs on separate microthread, concurrent with receive/compute
+    @fmovs(fabout_rx, fabin_tx, .{ .async = true });
+}
 
-    // Increment tracker and check for termination
+// =============================================================================
+// Send B Data
+// =============================================================================
+task send_b_task() void {
+    has_sent = true;
+    send_col = 0;
+    send_next_column();
+}
+
+fn send_next_column() void {
+    if (send_col >= dN_y) { return; }
+    const offset = send_col * dH;
+    var b_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &B, .extent = dH });
+    b_dsd = @increment_dsd_offset(b_dsd, offset, f32);
+    if (my_y_val == 0) {
+        const out_dsd = @get_dsd(fabout_dsd, .{
+            .fabric_color = broadcast_rx_color,
+            .extent = dH,
+            .output_queue = broadcast_oq,
+        });
+        @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
+    } else {
+        const out_dsd = @get_dsd(fabout_dsd, .{
+            .fabric_color = broadcast_tx_color,
+            .extent = dH,
+            .output_queue = broadcast_oq,
+        });
+        @fmovs(out_dsd, b_dsd, .{ .async = true, .activate = send_done_task_id });
+    }
+}
+
+task send_done_task() void {
+    send_col += 1;
+    if (send_col < dN_y) {
+        send_next_column();
+    } else if (my_y_val == 0) {
+        // All own columns sent — start bulk relay for upstream PEs
+        setup_relay();
+    }
+}
+
+// =============================================================================
+// Rotating Ring Reduction (Synchronous)
+// =============================================================================
+fn reduce() void {
+    const my_x = my_x_val;
+
+    const fsum_pe = reduce_col / dN;
+    const isum_pe = (fsum_pe + 1) % kernel_x_dim;
+
+    var c_col_dsd = C_dsd;
+    c_col_dsd = @increment_dsd_offset(c_col_dsd, fsum_count * dM, f32);
+
+    const fabin_reduce = @get_dsd(fabin_dsd, .{
+        .fabric_color = reduce_rx_color, .extent = dM, .input_queue = reduce_iq
+    });
+    const fabin_flyover = @get_dsd(fabin_dsd, .{
+        .fabric_color = flyover_color, .extent = dM, .input_queue = flyover_iq
+    });
+    const fabout_reduce = @get_dsd(fabout_dsd, .{
+        .fabric_color = reduce_tx_color, .extent = dM, .output_queue = reduce_oq
+    });
+    const fabout_flyover = @get_dsd(fabout_dsd, .{
+        .fabric_color = flyover_color, .extent = dM, .output_queue = flyover_oq
+    });
+
+    if (kernel_x_dim == 1) {
+        @fmovs(c_col_dsd, red_in_dsd, .{});
+        fsum_count += 1;
+    } else if (my_x == isum_pe) {
+        if (my_x == kernel_x_dim - 1) {
+            @fmovs(fabout_flyover, red_in_dsd, .{});
+        } else {
+            @fmovs(fabout_reduce, red_in_dsd, .{});
+        }
+    } else if (my_x == fsum_pe) {
+        if (my_x == 0) {
+            @fadds(c_col_dsd, red_in_dsd, fabin_flyover, .{});
+        } else {
+            @fadds(c_col_dsd, red_in_dsd, fabin_reduce, .{});
+        }
+        fsum_count += 1;
+    } else {
+        if (my_x == 0) {
+            @fadds(fabout_reduce, red_in_dsd, fabin_flyover, .{});
+        } else if (my_x == kernel_x_dim - 1) {
+            @fadds(fabout_flyover, red_in_dsd, fabin_reduce, .{});
+        } else {
+            @fadds(fabout_reduce, red_in_dsd, fabin_reduce, .{});
+        }
+    }
+
+    @fmovs(red_in_dsd, zeros_dsd, .{});
+
     reduce_col += 1;
     if (reduce_col == total_columns) {
         terminate_kernel();
     }
 }
 
+// =============================================================================
+// Entry point
+// =============================================================================
 fn broadcast_pe() void {
     start_timer();
 
-    // Explicit casts to i16 to fix compiler type mismatch
-    my_y_val = @as(i16, layout_mod.get_y_coord());
+    my_y_val = layout_mod.get_y_coord();
     my_x_val = @as(i16, layout_mod.get_x_coord());
-    my_send_start_col = my_y_val * dN_y;
+    my_send_start_col = @as(i16, my_y_val) * dN_y;
+
+    // Start DSD streaming receive for first B column
+    receive_next_column();
 
     if (my_y_val == 0) {
-        setup_relay();
         @activate(send_task_id);
     }
 }
@@ -107,12 +294,15 @@ fn terminate_kernel() void {
 
 comptime {
     @comptime_assert(@is_arch("wse2"));
-    @bind_local_task(send_b_task, send_task_id);
-    @bind_local_task(do_reduce, reduce_task_id);
 
-    @export_symbol(&A, "A");
-    @export_symbol(&B, "B");
-    @export_symbol(&C, "C");
-    @export_symbol(&time_buf_u16, "time_buf_u16");
+    // No data task bindings — using DSD streaming instead
+    @bind_local_task(send_b_task, send_task_id);
+    @bind_local_task(send_done_task, send_done_task_id);
+    @bind_local_task(column_done_task, column_done_id);
+
+    @export_symbol(ptr_A, "A");
+    @export_symbol(ptr_B, "B");
+    @export_symbol(ptr_C, "C");
+    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
     @export_symbol(broadcast_pe);
 }
